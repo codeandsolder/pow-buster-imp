@@ -155,22 +155,22 @@ Website operators deploying a PoW system bear the responsibility to understand t
 
 ## GPU solver backend
 
-The optional `gpu` feature exposes the same Rust GPU backend on native and `wasm32` targets. Its SHA-256 solver surface mirrors the CPU backend (`SingleBlockSolver`, `DoubleBlockSolver`, `DecimalSolver`, `BinarySolver`, and `GoAwaySolver`) and shares one reusable `GpuContext`. Compatible single-block layouts automatically select the optimized Gray-order kernel; other message layouts use generic correctness paths.
+The optional `gpu` feature exposes the same Rust GPU backend on native and `wasm32` targets. Its solver surface mirrors the CPU backend: `SingleBlockSolver`, `DoubleBlockSolver`, `DecimalSolver`, `BinarySolver`, `GoAwaySolver`, `CerberusSolver`, and `AltchaSha256Solver`, all sharing one reusable `GpuContext`. Compatible SHA-256 single-block layouts automatically select the optimized Gray-order kernel; other SHA-256 layouts use generic correctness paths, while Cerberus and Altcha use dedicated BLAKE3 and SHA/PBKDF2 pipelines.
 
 ```rust,ignore
 use core::num::NonZeroU8;
-use pow_buster::gpu::AnubisGpuSolver;
+use pow_buster::gpu::GpuContext;
 
-let mut solver = AnubisGpuSolver::create().await?;
-let solution = solver
-    .solve(challenge.as_bytes(), NonZeroU8::new(6).unwrap())
+let mut gpu = GpuContext::create().await?;
+let solution = gpu
+    .solve_anubis(challenge.as_bytes(), NonZeroU8::new(6).unwrap())
     .await?;
 println!("{}", solution.nonce);
 ```
 
-The Anubis convenience API shown above remains available. For a normal block-aligned Anubis challenge (including the usual 128-byte random data), it selects a reduced-radix Gray-order fast path. Arbitrary single/double-block decimal layouts, binary SHA-256 nonces, and GoAway messages are supported through the protocol-agnostic GPU solver types. Every winning proof is independently recomputed on the CPU before it is returned.
+The Anubis convenience API shown above remains available. For a normal block-aligned Anubis challenge (including the usual 128-byte random data), it selects a reduced-radix Gray-order fast path. Arbitrary single/double-block decimal layouts, binary SHA-256 nonces, GoAway, Cerberus (decimal and binary BLAKE3), and Altcha (nested SHA-256 and PBKDF2/SHA-256) are supported through protocol-agnostic GPU solver types. Every winning proof is independently recomputed on the CPU before it is returned.
 
-For browser use, build with `--target wasm32-unknown-unknown --features gpu`. The wasm-bindgen build exports `createAnubisGpuSolver()`, which returns an object with async `solve(prefix, difficulty)` and `warmUp()` methods backed by browser WebGPU. Calling `warmUp()` during extension/application startup moves lazy browser/driver pipeline setup out of the first real challenge. The SHA-256 hot loop executes in WGSL on the GPU; WASM only performs setup, dispatch and result handling.
+For browser use, build with `--target wasm32-unknown-unknown --features gpu`. The wasm-bindgen build exports `createGpuSolver()`, which returns one browser WebGPU context with async `solveJson()`, `solveAltchaJson()` and `warmUp()` methods. `solveJson()` routes Anubis, Cerberus, GoAway, mCaptcha and Cap.js descriptors/configurations through the corresponding GPU solver; Altcha uses the explicit method because its descriptor does not contain the target. Calling `warmUp()` during extension/application startup submits each compute pipeline once so the first real challenge does not pay lazy browser/driver setup costs. The proof-of-work hot loops execute in WGSL on the GPU; WASM performs setup, dispatch, adapter/protocol glue and result verification.
 
 ## Benchmark
 

@@ -287,6 +287,7 @@ impl GpuContext {
         self.queue.write_buffer(&self.out_buf, 0, &[0; 48]);
         self.queue
             .write_buffer(&self.in_buf, 0, bytemuck::bytes_of(&params));
+        self.queue.write_buffer(&self.generic_in_buf, 0, &[0; 256]);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -301,6 +302,36 @@ impl GpuContext {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.dispatch_workgroups(64, 1, 1);
         }
+        for (label, pipeline, bind_group) in [
+            (
+                "pow-buster-sha256-single-block-warmup",
+                &self.generic_pipeline,
+                &self.generic_bind_group,
+            ),
+            (
+                "pow-buster-sha256-multi-layout-warmup",
+                &self.multi_pipeline,
+                &self.multi_bind_group,
+            ),
+            (
+                "pow-buster-cerberus-warmup",
+                &self.cerberus_pipeline,
+                &self.cerberus_bind_group,
+            ),
+            (
+                "pow-buster-altcha-warmup",
+                &self.altcha_pipeline,
+                &self.altcha_bind_group,
+            ),
+        ] {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some(label),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
         encoder.copy_buffer_to_buffer(&self.out_buf, 0, &self.staging, 0, 48);
         self.queue.submit([encoder.finish()]);
         let _ = self.read_result().await?;
@@ -313,18 +344,18 @@ impl GpuContext {
     }
 
     /// Solve an Anubis SHA-256 challenge.
-    pub async fn solve(
+    pub async fn solve_anubis(
         &mut self,
         prefix: &[u8],
         difficulty: NonZeroU8,
     ) -> Result<GpuSolution, GpuError> {
-        self.solve_with_limit(prefix, difficulty, COUNTER_SPACE)
+        self.solve_anubis_with_limit(prefix, difficulty, COUNTER_SPACE)
             .await?
             .ok_or_else(|| GpuError::new("GPU search space exhausted"))
     }
 
     /// Solve an Anubis SHA-256 challenge while dispatching at most `max_hashes` candidates.
-    pub async fn solve_with_limit(
+    pub async fn solve_anubis_with_limit(
         &mut self,
         prefix: &[u8],
         difficulty: NonZeroU8,
@@ -413,7 +444,7 @@ impl GpuContext {
 
     /// Solve a parsed Anubis challenge descriptor.
     #[cfg(feature = "adapter")]
-    pub async fn solve_descriptor(
+    pub async fn solve_anubis_descriptor(
         &mut self,
         descriptor: &crate::adapter::anubis::ChallengeDescriptor,
     ) -> Result<GpuSolution, GpuError> {
@@ -427,7 +458,7 @@ impl GpuContext {
         }
         let difficulty = NonZeroU8::new(descriptor.rules().difficulty())
             .ok_or_else(|| GpuError::new("Anubis difficulty must be non-zero"))?;
-        self.solve(descriptor.challenge().as_ref().as_bytes(), difficulty)
+        self.solve_anubis(descriptor.challenge().as_ref().as_bytes(), difficulty)
             .await
     }
 
@@ -753,9 +784,6 @@ impl GpuContext {
         Ok(values)
     }
 }
-
-/// Backwards-compatible name for the original Anubis-only GPU context.
-pub type AnubisGpuSolver = GpuContext;
 
 /// Async GPU counterpart of the CPU single-block SHA-256 solver family.
 ///
