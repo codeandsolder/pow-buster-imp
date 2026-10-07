@@ -78,7 +78,8 @@ pub struct GpuContext {
 impl GpuContext {
     /// Create a GPU solver using the high-performance adapter selected by `wgpu`.
     pub async fn create() -> Result<Self, GpuError> {
-        let instance = wgpu::Instance::default();
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
