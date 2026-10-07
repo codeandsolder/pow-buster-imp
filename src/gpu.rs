@@ -90,7 +90,10 @@ impl GpuContext {
         let adapter_name = format!("{} ({:?}, {})", info.name, info.backend, info.driver);
         let limits = adapter.limits();
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
+            .request_device(&wgpu::DeviceDescriptor {
+                required_limits: wgpu::Limits::downlevel_defaults(),
+                ..Default::default()
+            })
             .await
             .map_err(|e| GpuError::new(format!("request GPU device: {e}")))?;
 
