@@ -1,3 +1,4 @@
+#![feature(portable_simd)]
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
@@ -179,7 +180,12 @@ cfg_if::cfg_if! {
             crate::solver::avx512::RequiredFeatures,
             crate::message::AltchaMessage,
             crate::solver::avx512::AltchaSha256Solver,
-            crate::solver::safe::AltchaSha256Solver,
+            crate::solver::SolverRouter<
+                crate::solver::avx2::RequiredFeatures,
+                crate::message::AltchaMessage,
+                crate::solver::avx2::AltchaSha256Solver,
+                crate::solver::safe::AltchaSha256Solver,
+            >,
         >;
     }
 }
@@ -228,7 +234,12 @@ cfg_if::cfg_if! {
             crate::solver::avx512::RequiredFeatures,
             crate::message::BinaryMessage,
             crate::solver::avx512::BinarySolver,
-            crate::solver::safe::BinarySolver,
+            crate::solver::SolverRouter<
+                crate::solver::avx2::RequiredFeatures,
+                crate::message::BinaryMessage,
+                crate::solver::avx2::BinarySolver,
+                crate::solver::safe::BinarySolver,
+            >,
         >;
         /// Go away solver
         pub type GoAwaySolver = crate::solver::SolverRouter<
@@ -278,7 +289,7 @@ cfg_if::cfg_if! {
             crate::solver::avx512::RequiredFeatures,
             crate::message::BinaryMessage,
             crate::solver::avx512::BinarySolver,
-            crate::solver::safe::BinarySolver,
+            crate::solver::avx2::BinarySolver,
         >;
         /// Go away solver
         pub type GoAwaySolver = crate::solver::SolverRouter<
@@ -353,7 +364,12 @@ cfg_if::cfg_if! {
             crate::solver::avx512::RequiredFeatures,
             crate::message::BinaryMessage,
             crate::solver::avx512::BinarySolver,
-            crate::solver::safe::BinarySolver,
+            crate::solver::SolverRouter<
+                crate::solver::avx2::RequiredFeatures,
+                crate::message::BinaryMessage,
+                crate::solver::avx2::BinarySolver,
+                crate::solver::safe::BinarySolver,
+            >,
         >;
         /// Go away solver
         pub type GoAwaySolver = crate::solver::SolverRouter<

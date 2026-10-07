@@ -1055,9 +1055,11 @@ impl crate::solver::Solver for BinarySolver {
     }
 
     fn solve<const TYPE: u8>(&mut self, target: u64, mask: u64) -> Option<(u64, [u32; 8])> {
-        if (self.message.nonce_byte_count.get() == 1) // edge case not worth optimizing, bail out
+        // A one-byte search has only 256 candidates, and a nonce crossing a SHA block boundary
+        // needs a distinct shuffle layout. Keep those rare cases on the scalar fallback instead of
+        // burdening the hot SIMD path with extra setup and branches.
+        if (self.message.nonce_byte_count.get() == 1)
             || (self.message.salt_residual_len + self.message.nonce_byte_count.get() as usize > 64)
-        // TODO: optimize edge case where nonce itself cross block boundary
         {
             crate::unlikely();
             let mut solver = crate::solver::safe::BinarySolver::from(self.message.clone());

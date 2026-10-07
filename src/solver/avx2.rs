@@ -1,8 +1,10 @@
+use sha2::digest::generic_array::GenericArray;
+
 use crate::{
     Align16, Align64, SWAP_DWORD_BYTE_ORDER, decompose_blocks_mut,
     message::{
-        AltchaMessage, CerberusMessage, DecimalMessage, DoubleBlockMessage, GoAwayMessage,
-        SingleBlockMessage,
+        AltchaMessage, BinaryMessage, CerberusMessage, DecimalMessage, DoubleBlockMessage,
+        GoAwayMessage, SingleBlockMessage,
     },
 };
 use core::arch::x86_64::*;
@@ -63,6 +65,78 @@ mod static_asserts {
 
 #[cfg(feature = "compare-64bit")]
 const INDEX_REMAP_PUNPCKLDQ: [usize; 8] = [0, 1, 4, 5, 2, 3, 6, 7];
+
+#[inline]
+#[target_feature(enable = "avx2")]
+fn find_sha256_target_lane<const TYPE: u8>(
+    word0: __m256i,
+    word1: __m256i,
+    target: u64,
+    mask: u64,
+) -> Option<usize> {
+    #[cfg(feature = "compare-64bit")]
+    {
+        let bias = _mm256_set1_epi64x(i64::MIN);
+        let cmp = |x: __m256i| {
+            if TYPE == crate::solver::SOLVE_TYPE_GT {
+                _mm256_cmpgt_epi64(
+                    _mm256_add_epi64(x, bias),
+                    _mm256_add_epi64(_mm256_set1_epi64x(target as _), bias),
+                )
+            } else if TYPE == crate::solver::SOLVE_TYPE_LT {
+                _mm256_cmpgt_epi64(
+                    _mm256_add_epi64(_mm256_set1_epi64x(target as _), bias),
+                    _mm256_add_epi64(x, bias),
+                )
+            } else {
+                _mm256_cmpeq_epi64(
+                    _mm256_and_si256(x, _mm256_set1_epi64x(mask as _)),
+                    _mm256_set1_epi64x((target & mask) as _),
+                )
+            }
+        };
+        let lo = cmp(_mm256_unpacklo_epi32(word1, word0));
+        let hi = cmp(_mm256_unpackhi_epi32(word1, word0));
+        if _mm256_testz_si256(lo, lo) != 0 && _mm256_testz_si256(hi, hi) != 0 {
+            return None;
+        }
+        let mut dump = Align64([0u64; 8]);
+        unsafe {
+            _mm256_store_si256(dump.as_mut_ptr().cast(), lo);
+            _mm256_store_si256(dump.as_mut_ptr().add(4).cast(), hi);
+        }
+        let packed_lane = dump.0.iter().position(|x| *x != 0)?;
+        Some(INDEX_REMAP_PUNPCKLDQ[packed_lane])
+    }
+    #[cfg(not(feature = "compare-64bit"))]
+    {
+        let bias = _mm256_set1_epi32(i32::MIN);
+        let target_hi = (target >> 32) as u32;
+        let mask_hi = (mask >> 32) as u32;
+        let met = if TYPE == crate::solver::SOLVE_TYPE_GT {
+            _mm256_cmpgt_epi32(
+                _mm256_add_epi32(word0, bias),
+                _mm256_add_epi32(_mm256_set1_epi32(target_hi as _), bias),
+            )
+        } else if TYPE == crate::solver::SOLVE_TYPE_LT {
+            _mm256_cmpgt_epi32(
+                _mm256_add_epi32(_mm256_set1_epi32(target_hi as _), bias),
+                _mm256_add_epi32(word0, bias),
+            )
+        } else {
+            _mm256_cmpeq_epi32(
+                _mm256_and_si256(word0, _mm256_set1_epi32(mask_hi as _)),
+                _mm256_set1_epi32((target_hi & mask_hi) as _),
+            )
+        };
+        if _mm256_testz_si256(met, met) != 0 {
+            return None;
+        }
+        let mut dump = Align64([0u32; 8]);
+        unsafe { _mm256_store_si256(dump.as_mut_ptr().cast(), met) };
+        dump.0.iter().position(|x| *x != 0)
+    }
+}
 
 cpufeatures::new!(avx2, "avx2");
 
@@ -289,7 +363,7 @@ impl SingleBlockSolver {
                         if TYPE == crate::solver::SOLVE_TYPE_GT {
                             _mm256_cmpgt_epi64(_mm256_add_epi64(x, bias), _mm256_add_epi64(y, bias))
                         } else if TYPE == crate::solver::SOLVE_TYPE_LT {
-                            _mm256_cmpgt_epi64(_mm256_add_epi64(y, bias), _mm256_add_epi64(y, bias))
+                            _mm256_cmpgt_epi64(_mm256_add_epi64(y, bias), _mm256_add_epi64(x, bias))
                         } else {
                             _mm256_cmpeq_epi64(
                                 _mm256_and_si256(x, _mm256_set1_epi64x(mask as _)),
@@ -682,7 +756,7 @@ impl DoubleBlockSolver {
                         if TYPE == crate::solver::SOLVE_TYPE_GT {
                             _mm256_cmpgt_epi64(_mm256_add_epi64(x, bias), _mm256_add_epi64(y, bias))
                         } else if TYPE == crate::solver::SOLVE_TYPE_LT {
-                            _mm256_cmpgt_epi64(_mm256_add_epi64(y, bias), _mm256_add_epi64(y, bias))
+                            _mm256_cmpgt_epi64(_mm256_add_epi64(y, bias), _mm256_add_epi64(x, bias))
                         } else {
                             _mm256_cmpeq_epi64(
                                 _mm256_and_si256(x, _mm256_set1_epi64x(mask as _)),
@@ -803,6 +877,380 @@ impl_decimal_solver!(
     [SingleBlockSolver, DoubleBlockSolver] => DecimalSolver
 );
 
+/// AVX2 binary nonce solver.
+///
+/// Output: nonce in little endian order
+///
+/// Current implementation: 8 way SIMD with 1-round hotstart granularity.
+pub struct BinarySolver {
+    message: BinaryMessage,
+    attempted_nonces: u64,
+    limit: u64,
+}
+
+impl From<BinaryMessage> for BinarySolver {
+    fn from(message: BinaryMessage) -> Self {
+        Self {
+            message,
+            attempted_nonces: 0,
+            limit: u64::MAX,
+        }
+    }
+}
+
+impl From<crate::solver::safe::BinarySolver> for BinarySolver {
+    fn from(solver: crate::solver::safe::BinarySolver) -> Self {
+        Self {
+            message: solver.message,
+            attempted_nonces: solver.attempted_nonces,
+            limit: solver.limit,
+        }
+    }
+}
+
+impl BinarySolver {
+    #[inline(never)]
+    #[target_feature(enable = "avx2")]
+    fn solve_impl<
+        const TYPE: u8,
+        const FIRST_NONCE_WORD_IDX: usize,
+        const NEED_SECOND_BLOCK: bool,
+    >(
+        &mut self,
+        prefix_state: [u32; 8],
+        first_block: &Align64<[u32; 16]>,
+        second_block_schedule: &[u32; 64],
+        nonce_byte_offset: usize,
+        nonce_byte_count: core::num::NonZeroU8,
+        target: u64,
+        mask: u64,
+    ) -> Option<u64> {
+        let target = target & mask;
+
+        // at most 3 words may need to be patched (i.e. 96 bits)
+        // from which word to poke the nonce?
+        let poke_word_base = FIRST_NONCE_WORD_IDX.min(16 - 4);
+        let poke_word_byte_base = poke_word_base * 4;
+        let mut poke_word_tbl = Align16([!0u8; 16]);
+        let nonce_byte_count_decr = nonce_byte_count.get() as usize - 1;
+        for (i, ix) in ((nonce_byte_offset + 1)..)
+            .take(nonce_byte_count_decr)
+            .enumerate()
+        {
+            poke_word_tbl.0[unsafe {
+                *crate::SWAP_DWORD_BYTE_ORDER.get_unchecked(ix - poke_word_byte_base)
+            }] = i as u8;
+        }
+        let poke_word_tbl = unsafe { _mm_load_si128(poke_word_tbl.as_ptr().cast()) };
+        let lane_id_byte_remainder = 3 - nonce_byte_offset % 4;
+        let mut lane_id_base = Align64([0u32; 8]);
+        for i in 0..8 {
+            lane_id_base[i as usize] = i << (lane_id_byte_remainder * 8);
+        }
+        let lane_id_iterand = 8 << (lane_id_byte_remainder * 8);
+
+        let mut memo_state = prefix_state;
+        crate::sha256::ingest_message_prefix::<FIRST_NONCE_WORD_IDX>(
+            &mut memo_state,
+            first_block[..FIRST_NONCE_WORD_IDX].try_into().unwrap(),
+        );
+
+        for x in 0..(self
+            .limit
+            .min(256u64.saturating_pow(nonce_byte_count_decr as u32))
+            .max(1))
+        {
+            unsafe {
+                let mut block_tpl = *first_block;
+                let xm = _mm_cvtsi64x_si128(x as _);
+                let xmd = _mm_shuffle_epi8(xm, poke_word_tbl);
+                let loadd = _mm_loadu_si128(block_tpl.as_ptr().add(poke_word_base).cast());
+                _mm_storeu_si128(
+                    block_tpl.as_mut_ptr().add(poke_word_base).cast(),
+                    _mm_or_si128(loadd, xmd),
+                );
+                let mut lane_id_v = _mm256_load_si256(lane_id_base.as_ptr().cast());
+
+                for lane_id_set_idx in 0..(256 / 8) {
+                    macro_rules! get_msg {
+                        ($idx:expr) => {
+                            if $idx == FIRST_NONCE_WORD_IDX {
+                                _mm256_or_epi32(_mm256_set1_epi32(block_tpl[$idx] as _), lane_id_v)
+                            } else {
+                                _mm256_set1_epi32(block_tpl[$idx] as _)
+                            }
+                        };
+                    }
+
+                    let mut state = core::array::from_fn(|i| _mm256_set1_epi32(memo_state[i] as _));
+                    let mut msg = [
+                        get_msg!(0),
+                        get_msg!(1),
+                        get_msg!(2),
+                        get_msg!(3),
+                        get_msg!(4),
+                        get_msg!(5),
+                        get_msg!(6),
+                        get_msg!(7),
+                        get_msg!(8),
+                        get_msg!(9),
+                        get_msg!(10),
+                        get_msg!(11),
+                        get_msg!(12),
+                        get_msg!(13),
+                        get_msg!(14),
+                        get_msg!(15),
+                    ];
+
+                    crate::sha256::avx2::multiway_arx::<FIRST_NONCE_WORD_IDX>(&mut state, &mut msg);
+
+                    if NEED_SECOND_BLOCK {
+                        for i in 0..8 {
+                            state[i] =
+                                _mm256_add_epi32(state[i], _mm256_set1_epi32(prefix_state[i] as _));
+                        }
+                        let save_a = state[0];
+                        #[cfg(feature = "compare-64bit")]
+                        let save_b = state[1];
+
+                        crate::sha256::avx2::bcst_multiway_arx::<0>(
+                            &mut state,
+                            second_block_schedule,
+                        );
+                        state[0] = _mm256_add_epi32(state[0], save_a);
+                        #[cfg(feature = "compare-64bit")]
+                        {
+                            state[1] = _mm256_add_epi32(state[1], save_b);
+                        }
+                    } else {
+                        state[0] =
+                            _mm256_add_epi32(state[0], _mm256_set1_epi32(prefix_state[0] as _));
+                        #[cfg(feature = "compare-64bit")]
+                        {
+                            state[1] =
+                                _mm256_add_epi32(state[1], _mm256_set1_epi32(prefix_state[1] as _));
+                        }
+                    }
+
+                    #[cfg(not(feature = "compare-64bit"))]
+                    let cmp_fn = |x: __m256i, y: __m256i| {
+                        let bias = _mm256_set1_epi32(i32::MIN);
+                        if TYPE == crate::solver::SOLVE_TYPE_GT {
+                            _mm256_cmpgt_epi32(_mm256_add_epi32(x, bias), _mm256_add_epi32(y, bias))
+                        } else if TYPE == crate::solver::SOLVE_TYPE_LT {
+                            _mm256_cmpgt_epi32(_mm256_add_epi32(y, bias), _mm256_add_epi32(x, bias))
+                        } else {
+                            _mm256_cmpeq_epi32(
+                                _mm256_and_si256(x, _mm256_set1_epi32((mask >> 32) as _)),
+                                y,
+                            )
+                        }
+                    };
+
+                    #[cfg(feature = "compare-64bit")]
+                    let cmp64_fn = |x: __m256i, y: __m256i| {
+                        let bias = _mm256_set1_epi64x(i64::MIN);
+                        if TYPE == crate::solver::SOLVE_TYPE_GT {
+                            _mm256_cmpgt_epi64(_mm256_add_epi64(x, bias), _mm256_add_epi64(y, bias))
+                        } else if TYPE == crate::solver::SOLVE_TYPE_LT {
+                            _mm256_cmpgt_epi64(_mm256_add_epi64(y, bias), _mm256_add_epi64(x, bias))
+                        } else {
+                            _mm256_cmpeq_epi64(
+                                _mm256_and_si256(x, _mm256_set1_epi64x(mask as _)),
+                                y,
+                            )
+                        }
+                    };
+
+                    #[cfg(not(feature = "compare-64bit"))]
+                    let met_target = cmp_fn(state[0], _mm256_set1_epi32((target >> 32) as _));
+
+                    #[cfg(feature = "compare-64bit")]
+                    let result_ab_lo = _mm256_unpacklo_epi32(state[1], state[0]);
+                    #[cfg(feature = "compare-64bit")]
+                    let result_ab_hi = _mm256_unpackhi_epi32(state[1], state[0]);
+                    #[cfg(feature = "compare-64bit")]
+                    let (met_target_hi, met_target_lo) = {
+                        let lo = cmp64_fn(result_ab_lo, _mm256_set1_epi64x(target as _));
+                        let hi = cmp64_fn(result_ab_hi, _mm256_set1_epi64x(target as _));
+                        (hi, lo)
+                    };
+
+                    #[cfg(feature = "compare-64bit")]
+                    let nothit = _mm256_testz_si256(met_target_hi, met_target_hi)
+                        & _mm256_testz_si256(met_target_lo, met_target_lo);
+                    #[cfg(not(feature = "compare-64bit"))]
+                    let nothit = _mm256_testz_si256(met_target, met_target);
+
+                    if nothit == 0 {
+                        crate::unlikely();
+
+                        #[cfg(not(feature = "compare-64bit"))]
+                        let success_lane_idx = {
+                            let mut dump = Align64([0u32; 8]);
+                            _mm256_store_si256(dump.as_mut_ptr().cast(), met_target);
+                            dump.0.iter().position(|x| *x != 0).unwrap()
+                        };
+                        #[cfg(feature = "compare-64bit")]
+                        let success_lane_idx = INDEX_REMAP_PUNPCKLDQ[{
+                            let mut dump = Align64([0u64; 8]);
+                            _mm256_store_si256(dump.as_mut_ptr().cast(), met_target_lo);
+                            _mm256_store_si256(dump.as_mut_ptr().add(4).cast(), met_target_hi);
+                            dump.0.iter().position(|x| *x != 0).unwrap()
+                        }];
+
+                        let nonce_addend = 8 * lane_id_set_idx + success_lane_idx;
+
+                        let nonce = x << 8 | nonce_addend as u64;
+
+                        return Some(nonce);
+                    }
+
+                    lane_id_v = _mm256_add_epi32(lane_id_v, _mm256_set1_epi32(lane_id_iterand));
+                    self.attempted_nonces += 8;
+                }
+
+                if self.attempted_nonces >= self.limit {
+                    return None;
+                }
+            }
+        }
+
+        None
+    }
+}
+
+impl crate::solver::Solver for BinarySolver {
+    type Output = [u32; 8];
+    fn set_limit(&mut self, limit: u64) {
+        self.limit = limit;
+    }
+
+    fn get_attempted_nonces(&self) -> u64 {
+        self.attempted_nonces
+    }
+
+    fn solve<const TYPE: u8>(&mut self, target: u64, mask: u64) -> Option<(u64, [u32; 8])> {
+        // A one-byte search has only 256 candidates, and a nonce crossing a SHA block boundary
+        // needs a distinct shuffle layout. Keep those rare cases on the scalar fallback instead of
+        // burdening the hot SIMD path with extra setup and branches.
+        if (self.message.nonce_byte_count.get() == 1)
+            || (self.message.salt_residual_len + self.message.nonce_byte_count.get() as usize > 64)
+        {
+            crate::unlikely();
+            let mut solver = crate::solver::safe::BinarySolver::from(self.message.clone());
+            return solver.solve::<TYPE>(target, mask);
+        }
+
+        let salt = &self.message.salt_residual[..self.message.salt_residual_len];
+        let mut blocks = [GenericArray::default(); 2];
+        blocks[0][..salt.len()].copy_from_slice(salt);
+        let mut ptr = salt.len();
+        let mut cur_block = 0;
+
+        for _ in 0..self.message.nonce_byte_count.get() {
+            blocks[cur_block][ptr] = 0;
+            ptr += 1;
+            if ptr == 64 {
+                cur_block = 1;
+                ptr = 0;
+            }
+        }
+        blocks[cur_block][ptr] = 0x80;
+        ptr += 1;
+        if ptr + 8 > 64 {
+            cur_block = 1;
+        }
+        blocks[cur_block][(64 - 8)..]
+            .copy_from_slice(&(self.message.message_length * 8).to_be_bytes());
+
+        let used_blocks = &mut blocks[..=cur_block];
+
+        let mut block_template_be = Align64([0; 16]);
+        for i in 0..16 {
+            block_template_be[i] =
+                u32::from_be_bytes(used_blocks[0][i * 4..][..4].try_into().unwrap());
+        }
+
+        let mut second_block_schedule = [0; 64];
+        if cur_block == 1 {
+            for i in 0..16 {
+                second_block_schedule[i] =
+                    u32::from_be_bytes(used_blocks[1][i * 4..][..4].try_into().unwrap());
+            }
+            crate::sha256::do_message_schedule_k_w(&mut second_block_schedule);
+        }
+
+        macro_rules! dispatch {
+            ($skipped_rounds:expr) => {
+                unsafe {
+                    if cur_block == 1 {
+                        if let Some(nonce) = self.solve_impl::<TYPE, { $skipped_rounds }, true>(
+                            *self.message.prefix_state,
+                            &block_template_be,
+                            &second_block_schedule,
+                            self.message.salt_residual_len,
+                            self.message.nonce_byte_count,
+                            target,
+                            mask,
+                        ) {
+                            let mut final_sha_state = self.message.prefix_state;
+                            for i in 0..self.message.nonce_byte_count.get() as usize {
+                                used_blocks[0][self.message.salt_residual_len + i] =
+                                    nonce.to_le_bytes()[i];
+                            }
+                            sha2::compress256(&mut final_sha_state, &used_blocks);
+                            return Some((nonce, final_sha_state.0));
+                        }
+                    } else {
+                        if let Some(nonce) = self.solve_impl::<TYPE, { $skipped_rounds }, false>(
+                            *self.message.prefix_state,
+                            &block_template_be,
+                            &[0; 64],
+                            self.message.salt_residual_len,
+                            self.message.nonce_byte_count,
+                            target,
+                            mask,
+                        ) {
+                            let mut final_sha_state = self.message.prefix_state;
+                            for i in 0..self.message.nonce_byte_count.get() as usize {
+                                used_blocks[0][self.message.salt_residual_len + i] =
+                                    nonce.to_le_bytes()[i];
+                            }
+                            sha2::compress256(&mut final_sha_state, &used_blocks);
+                            return Some((nonce, final_sha_state.0));
+                        }
+                    }
+                }
+            };
+        }
+
+        match self.message.salt_residual_len / 4 {
+            0 => dispatch!(0),
+            1 => dispatch!(1),
+            2 => dispatch!(2),
+            3 => dispatch!(3),
+            4 => dispatch!(4),
+            5 => dispatch!(5),
+            6 => dispatch!(6),
+            7 => dispatch!(7),
+            8 => dispatch!(8),
+            9 => dispatch!(9),
+            10 => dispatch!(10),
+            11 => dispatch!(11),
+            12 => dispatch!(12),
+            13 => dispatch!(13),
+            14 => dispatch!(14),
+            15 => dispatch!(15),
+            _ => unreachable!(),
+        }
+
+        crate::unlikely();
+
+        None
+    }
+}
+
 /// AVX2 GoAway solver.
 ///
 ///
@@ -908,7 +1356,7 @@ impl GoAwaySolver {
                     if TYPE == crate::solver::SOLVE_TYPE_GT {
                         _mm256_cmpgt_epi64(_mm256_add_epi64(x, bias), _mm256_add_epi64(y, bias))
                     } else if TYPE == crate::solver::SOLVE_TYPE_LT {
-                        _mm256_cmpgt_epi64(_mm256_add_epi64(y, bias), _mm256_add_epi64(y, bias))
+                        _mm256_cmpgt_epi64(_mm256_add_epi64(y, bias), _mm256_add_epi64(x, bias))
                     } else {
                         _mm256_cmpeq_epi64(_mm256_and_si256(x, _mm256_set1_epi64x(mask as _)), y)
                     }
@@ -1397,221 +1845,231 @@ impl From<AltchaMessage> for AltchaSha256Solver {
 
 impl AltchaSha256Solver {
     #[inline(never)]
+    #[target_feature(enable = "avx2")]
     fn solve_nested_impl<const TYPE: u8, const KW: usize>(
         &mut self,
         target: u64,
         mask: u64,
     ) -> Option<(u64, [u32; 8])> {
-        unsafe {
-            for counter in (0u32..).step_by(8) {
-                if self.attempted_nonces >= self.limit {
-                    return None;
-                }
+        for counter in (0u32..).step_by(8) {
+            if self.attempted_nonces >= self.limit {
+                return None;
+            }
 
-                let mut blocks = [
-                    _mm256_set1_epi32(i32::from_be_bytes(
-                        self.message.salt[0..4].try_into().unwrap(),
-                    )),
-                    _mm256_set1_epi32(i32::from_be_bytes(
-                        self.message.salt[4..8].try_into().unwrap(),
-                    )),
-                    _mm256_set1_epi32(i32::from_be_bytes(
-                        self.message.salt[8..12].try_into().unwrap(),
-                    )),
-                    _mm256_set1_epi32(i32::from_be_bytes(
-                        self.message.salt[12..16].try_into().unwrap(),
-                    )),
-                    _mm256_set1_epi32(i32::from_be_bytes(
-                        self.message.nonce[0..4].try_into().unwrap(),
-                    )),
-                    _mm256_set1_epi32(i32::from_be_bytes(
-                        self.message.nonce[4..8].try_into().unwrap(),
-                    )),
-                    _mm256_set1_epi32(i32::from_be_bytes(
-                        self.message.nonce[8..12].try_into().unwrap(),
-                    )),
-                    _mm256_set1_epi32(i32::from_be_bytes(
-                        self.message.nonce[12..16].try_into().unwrap(),
-                    )),
-                    _mm256_xor_si256(
-                        _mm256_set1_epi32(counter as _),
-                        _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7),
-                    ),
+            let mut blocks = [
+                _mm256_set1_epi32(i32::from_be_bytes(
+                    self.message.salt[0..4].try_into().unwrap(),
+                )),
+                _mm256_set1_epi32(i32::from_be_bytes(
+                    self.message.salt[4..8].try_into().unwrap(),
+                )),
+                _mm256_set1_epi32(i32::from_be_bytes(
+                    self.message.salt[8..12].try_into().unwrap(),
+                )),
+                _mm256_set1_epi32(i32::from_be_bytes(
+                    self.message.salt[12..16].try_into().unwrap(),
+                )),
+                _mm256_set1_epi32(i32::from_be_bytes(
+                    self.message.nonce[0..4].try_into().unwrap(),
+                )),
+                _mm256_set1_epi32(i32::from_be_bytes(
+                    self.message.nonce[4..8].try_into().unwrap(),
+                )),
+                _mm256_set1_epi32(i32::from_be_bytes(
+                    self.message.nonce[8..12].try_into().unwrap(),
+                )),
+                _mm256_set1_epi32(i32::from_be_bytes(
+                    self.message.nonce[12..16].try_into().unwrap(),
+                )),
+                _mm256_xor_si256(
+                    _mm256_set1_epi32(counter as _),
+                    _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7),
+                ),
+                _mm256_set1_epi32(i32::from_be_bytes([0x80, 0, 0, 0])),
+                _mm256_setzero_si256(),
+                _mm256_setzero_si256(),
+                _mm256_setzero_si256(),
+                _mm256_setzero_si256(),
+                _mm256_setzero_si256(),
+                _mm256_set1_epi32((32 + 4) * 8),
+            ];
+
+            //core::arch::asm!("# LLVM-MCA-BEGIN altcha_nested_impl",);
+
+            for r in 0..self.message.cost.get() {
+                // key truncation if needed (generally not)
+                if KW < 8 && r > 0 {
+                    blocks[KW] = _mm256_set1_epi32(0x80);
+                    for i in (KW + 1)..8 {
+                        blocks[i] = _mm256_setzero_si256();
+                    }
+                }
+                let mut state =
+                    core::array::from_fn(|i| _mm256_set1_epi32(crate::sha256::IV[i] as _));
+                crate::sha256::avx2::multiway_arx::<0>(&mut state, &mut blocks);
+
+                // vpaddd blocks, state, dword bcst [] ; result goes in blocks[0..8], overwrite entire variable to defuse loop dependency
+                blocks = [
+                    _mm256_add_epi32(state[0], _mm256_set1_epi32(crate::sha256::IV[0] as _)),
+                    _mm256_add_epi32(state[1], _mm256_set1_epi32(crate::sha256::IV[1] as _)),
+                    _mm256_add_epi32(state[2], _mm256_set1_epi32(crate::sha256::IV[2] as _)),
+                    _mm256_add_epi32(state[3], _mm256_set1_epi32(crate::sha256::IV[3] as _)),
+                    _mm256_add_epi32(state[4], _mm256_set1_epi32(crate::sha256::IV[4] as _)),
+                    _mm256_add_epi32(state[5], _mm256_set1_epi32(crate::sha256::IV[5] as _)),
+                    _mm256_add_epi32(state[6], _mm256_set1_epi32(crate::sha256::IV[6] as _)),
+                    _mm256_add_epi32(state[7], _mm256_set1_epi32(crate::sha256::IV[7] as _)),
                     _mm256_set1_epi32(i32::from_be_bytes([0x80, 0, 0, 0])),
                     _mm256_setzero_si256(),
                     _mm256_setzero_si256(),
                     _mm256_setzero_si256(),
                     _mm256_setzero_si256(),
                     _mm256_setzero_si256(),
-                    _mm256_set1_epi32((32 + 4) * 8),
+                    _mm256_setzero_si256(),
+                    _mm256_set1_epi32((KW * 4 * 8) as i32),
                 ];
-
-                //core::arch::asm!("# LLVM-MCA-BEGIN altcha_nested_impl",);
-
-                for r in 0..self.message.cost.get() {
-                    // key truncation if needed (generally not)
-                    if KW < 8 && r > 0 {
-                        blocks[KW] = _mm256_set1_epi32(0x80);
-                        for i in (KW + 1)..8 {
-                            blocks[i] = _mm256_setzero_si256();
-                        }
-                    }
-                    let mut state =
-                        core::array::from_fn(|i| _mm256_set1_epi32(crate::sha256::IV[i] as _));
-                    crate::sha256::avx2::multiway_arx::<0>(&mut state, &mut blocks);
-
-                    // vpaddd blocks, state, dword bcst [] ; result goes in blocks[0..8], overwrite entire variable to defuse loop dependency
-                    blocks = [
-                        _mm256_add_epi32(state[0], _mm256_set1_epi32(crate::sha256::IV[0] as _)),
-                        _mm256_add_epi32(state[1], _mm256_set1_epi32(crate::sha256::IV[1] as _)),
-                        _mm256_add_epi32(state[2], _mm256_set1_epi32(crate::sha256::IV[2] as _)),
-                        _mm256_add_epi32(state[3], _mm256_set1_epi32(crate::sha256::IV[3] as _)),
-                        _mm256_add_epi32(state[4], _mm256_set1_epi32(crate::sha256::IV[4] as _)),
-                        _mm256_add_epi32(state[5], _mm256_set1_epi32(crate::sha256::IV[5] as _)),
-                        _mm256_add_epi32(state[6], _mm256_set1_epi32(crate::sha256::IV[6] as _)),
-                        _mm256_add_epi32(state[7], _mm256_set1_epi32(crate::sha256::IV[7] as _)),
-                        _mm256_set1_epi32(i32::from_be_bytes([0x80, 0, 0, 0])),
-                        _mm256_setzero_si256(),
-                        _mm256_setzero_si256(),
-                        _mm256_setzero_si256(),
-                        _mm256_setzero_si256(),
-                        _mm256_setzero_si256(),
-                        _mm256_setzero_si256(),
-                        _mm256_set1_epi32((KW * 4 * 8) as i32),
-                    ];
-                }
-
-                let cmp_fn = |x: __m256i, y: __m256i| {
-                    let bias = _mm256_set1_epi32(i32::MIN);
-                    if TYPE == crate::solver::SOLVE_TYPE_GT {
-                        _mm256_cmpgt_epi32(_mm256_add_epi32(x, bias), _mm256_add_epi32(y, bias))
-                    } else if TYPE == crate::solver::SOLVE_TYPE_LT {
-                        _mm256_cmpgt_epi32(_mm256_add_epi32(y, bias), _mm256_add_epi32(x, bias))
-                    } else {
-                        _mm256_cmpeq_epi32(
-                            _mm256_and_si256(x, _mm256_set1_epi32((mask >> 32) as _)),
-                            y,
-                        )
-                    }
-                };
-                let met_target = cmp_fn(blocks[0], _mm256_set1_epi32((target >> 32) as _));
-                let nothit = _mm256_testz_si256(met_target, met_target);
-
-                if nothit == 0 {
-                    crate::unlikely();
-                    let success_lane_idx = {
-                        let mut dump = Align64([0u32; 8]);
-                        _mm256_store_si256(dump.as_mut_ptr().cast(), met_target);
-                        dump.0.iter().position(|x| *x != 0).unwrap()
-                    };
-
-                    let perm = _mm256_set1_epi32(success_lane_idx as _);
-                    for i in 0..8 {
-                        blocks[i] = _mm256_permutexvar_epi32(perm, blocks[i]);
-                    }
-                    return Some((
-                        counter as u64 + success_lane_idx as u64,
-                        core::array::from_fn(|i| {
-                            _mm_extract_epi32(_mm256_castsi256_si128(blocks[i]), 0) as u32
-                        }),
-                    ));
-                }
-
-                self.attempted_nonces += 8;
-
-                //core::arch::asm!("# LLVM-MCA-END altcha_nested_impl",);
             }
+
+            self.attempted_nonces += 8;
+            if let Some(success_lane_idx) =
+                find_sha256_target_lane::<TYPE>(blocks[0], blocks[1], target, mask)
+            {
+                crate::unlikely();
+
+                let perm = _mm256_set1_epi32(success_lane_idx as _);
+                for i in 0..8 {
+                    blocks[i] = _mm256_permutevar8x32_epi32(blocks[i], perm);
+                }
+                return Some((
+                    counter as u64 + success_lane_idx as u64,
+                    core::array::from_fn(|i| {
+                        _mm_extract_epi32(_mm256_castsi256_si128(blocks[i]), 0) as u32
+                    }),
+                ));
+            }
+
+            //core::arch::asm!("# LLVM-MCA-END altcha_nested_impl",);
         }
         None
     }
 
     #[inline(never)]
+    #[target_feature(enable = "avx2")]
     fn solve_pbkdf2_impl<const TYPE: u8>(
         &mut self,
         target: u64,
         mask: u64,
     ) -> Option<(u64, [u32; 8])> {
-        unsafe {
-            for counter in (0u32..).step_by(8) {
-                if self.attempted_nonces >= self.limit {
-                    return None;
+        for counter in (0u32..).step_by(8) {
+            if self.attempted_nonces >= self.limit {
+                return None;
+            }
+
+            // first compute HMAC midstate
+            let hmac_state = {
+                let mut midstate_ipad =
+                    core::array::from_fn(|i| _mm256_set1_epi32(crate::sha256::IV[i] as _));
+                let mut blocks =
+                    core::array::from_fn(|_| _mm256_set1_epi32(crate::solver::HMAC_IPAD32 as _));
+                for i in 0..4 {
+                    blocks[i] = _mm256_xor_si256(
+                        blocks[i],
+                        _mm256_set1_epi32(i32::from_be_bytes(
+                            self.message.nonce[i * 4..][..4].try_into().unwrap(),
+                        )),
+                    );
+                }
+                blocks[4] = _mm256_xor_si256(
+                    blocks[4],
+                    _mm256_xor_si256(
+                        _mm256_set1_epi32(counter as _),
+                        _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7),
+                    ),
+                );
+                crate::sha256::avx2::multiway_arx::<0>(&mut midstate_ipad, &mut blocks);
+                let mut midstate_opad =
+                    core::array::from_fn(|i| _mm256_set1_epi32(crate::sha256::IV[i] as _));
+                blocks =
+                    core::array::from_fn(|_| _mm256_set1_epi32(crate::solver::HMAC_OPAD32 as _));
+                for i in 0..4 {
+                    blocks[i] = _mm256_xor_si256(
+                        blocks[i],
+                        _mm256_set1_epi32(i32::from_be_bytes(
+                            self.message.nonce[i * 4..][..4].try_into().unwrap(),
+                        )),
+                    );
+                }
+                blocks[4] = _mm256_xor_si256(
+                    blocks[4],
+                    _mm256_xor_si256(
+                        _mm256_set1_epi32(counter as _),
+                        _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7),
+                    ),
+                );
+
+                crate::sha256::avx2::multiway_arx::<0>(&mut midstate_opad, &mut blocks);
+
+                for i in 0..8 {
+                    midstate_ipad[i] = _mm256_add_epi32(
+                        midstate_ipad[i],
+                        _mm256_set1_epi32(crate::sha256::IV[i] as _),
+                    );
+                    midstate_opad[i] = _mm256_add_epi32(
+                        midstate_opad[i],
+                        _mm256_set1_epi32(crate::sha256::IV[i] as _),
+                    );
                 }
 
-                // first compute HMAC midstate
-                let hmac_state = {
-                    let mut midstate_ipad =
-                        core::array::from_fn(|i| _mm256_set1_epi32(crate::sha256::IV[i] as _));
-                    let mut blocks = core::array::from_fn(|_| {
-                        _mm256_set1_epi32(crate::solver::HMAC_IPAD32 as _)
-                    });
-                    for i in 0..4 {
-                        blocks[i] = _mm256_xor_si256(
-                            blocks[i],
-                            _mm256_set1_epi32(i32::from_be_bytes(
-                                self.message.nonce[i * 4..][..4].try_into().unwrap(),
-                            )),
-                        );
-                    }
-                    blocks[4] = _mm256_xor_si256(
-                        blocks[4],
-                        _mm256_xor_si256(
-                            _mm256_set1_epi32(counter as _),
-                            _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7),
-                        ),
-                    );
-                    crate::sha256::avx2::multiway_arx::<0>(&mut midstate_ipad, &mut blocks);
-                    let mut midstate_opad =
-                        core::array::from_fn(|i| _mm256_set1_epi32(crate::sha256::IV[i] as _));
-                    blocks = core::array::from_fn(|_| {
-                        _mm256_set1_epi32(crate::solver::HMAC_OPAD32 as _)
-                    });
-                    for i in 0..4 {
-                        blocks[i] = _mm256_xor_si256(
-                            blocks[i],
-                            _mm256_set1_epi32(i32::from_be_bytes(
-                                self.message.nonce[i * 4..][..4].try_into().unwrap(),
-                            )),
-                        );
-                    }
-                    blocks[4] = _mm256_xor_si256(
-                        blocks[4],
-                        _mm256_xor_si256(
-                            _mm256_set1_epi32(counter as _),
-                            _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7),
-                        ),
-                    );
+                [midstate_ipad, midstate_opad]
+            };
 
-                    crate::sha256::avx2::multiway_arx::<0>(&mut midstate_opad, &mut blocks);
+            // load salt
+            let mut blocks = [
+                _mm256_set1_epi32(
+                    i32::from_be_bytes(self.message.salt[0..4].try_into().unwrap()) as _,
+                ),
+                _mm256_set1_epi32(
+                    i32::from_be_bytes(self.message.salt[4..8].try_into().unwrap()) as _,
+                ),
+                _mm256_set1_epi32(
+                    i32::from_be_bytes(self.message.salt[8..12].try_into().unwrap()) as _,
+                ),
+                _mm256_set1_epi32(
+                    i32::from_be_bytes(self.message.salt[12..16].try_into().unwrap()) as _,
+                ),
+                _mm256_set1_epi32(1), // pbkdf counter
+                _mm256_set1_epi32(i32::from_be_bytes([0x80, 0, 0, 0]) as _),
+                _mm256_setzero_si256(),
+                _mm256_setzero_si256(),
+                _mm256_setzero_si256(),
+                _mm256_setzero_si256(),
+                _mm256_setzero_si256(),
+                _mm256_setzero_si256(),
+                _mm256_setzero_si256(),
+                _mm256_setzero_si256(),
+                _mm256_setzero_si256(),
+                _mm256_set1_epi32(512 + ((16 + 4) * 8) as i32),
+            ];
 
-                    for i in 0..8 {
-                        midstate_ipad[i] = _mm256_add_epi32(
-                            midstate_ipad[i],
-                            _mm256_set1_epi32(crate::sha256::IV[i] as _),
-                        );
-                        midstate_opad[i] = _mm256_add_epi32(
-                            midstate_opad[i],
-                            _mm256_set1_epi32(crate::sha256::IV[i] as _),
-                        );
-                    }
+            let mut result: [__m256i; 8] = core::array::from_fn(|_| _mm256_setzero_si256());
 
-                    [midstate_ipad, midstate_opad]
-                };
+            //core::arch::asm!("# LLVM-MCA-BEGIN altcha_pbkdf2_impl",);
 
-                // load salt
-                let mut blocks = [
-                    _mm256_set1_epi32(i32::from_be_bytes(
-                        self.message.salt[0..4].try_into().unwrap(),
-                    ) as _),
-                    _mm256_set1_epi32(i32::from_be_bytes(
-                        self.message.salt[4..8].try_into().unwrap(),
-                    ) as _),
-                    _mm256_set1_epi32(i32::from_be_bytes(
-                        self.message.salt[8..12].try_into().unwrap(),
-                    ) as _),
-                    _mm256_set1_epi32(i32::from_be_bytes(
-                        self.message.salt[12..16].try_into().unwrap(),
-                    ) as _),
-                    _mm256_set1_epi32(1), // pbkdf counter
+            for r in 0..(2 * self.message.cost.get()) {
+                let midstate = &hmac_state[(r % 2) as usize];
+
+                let mut state = *midstate;
+
+                crate::sha256::avx2::multiway_arx::<0>(&mut state, &mut blocks);
+
+                blocks = [
+                    _mm256_add_epi32(state[0], midstate[0]),
+                    _mm256_add_epi32(state[1], midstate[1]),
+                    _mm256_add_epi32(state[2], midstate[2]),
+                    _mm256_add_epi32(state[3], midstate[3]),
+                    _mm256_add_epi32(state[4], midstate[4]),
+                    _mm256_add_epi32(state[5], midstate[5]),
+                    _mm256_add_epi32(state[6], midstate[6]),
+                    _mm256_add_epi32(state[7], midstate[7]),
                     _mm256_set1_epi32(i32::from_be_bytes([0x80, 0, 0, 0]) as _),
                     _mm256_setzero_si256(),
                     _mm256_setzero_si256(),
@@ -1619,92 +2077,54 @@ impl AltchaSha256Solver {
                     _mm256_setzero_si256(),
                     _mm256_setzero_si256(),
                     _mm256_setzero_si256(),
-                    _mm256_setzero_si256(),
-                    _mm256_setzero_si256(),
-                    _mm256_setzero_si256(),
-                    _mm256_set1_epi32(512 + ((16 + 4) * 8) as i32),
+                    _mm256_set1_epi32(512 + 256),
                 ];
 
-                let mut result: [__m256i; 8] = core::mem::zeroed();
-
-                //core::arch::asm!("# LLVM-MCA-BEGIN altcha_pbkdf2_impl",);
-
-                for r in 0..(2 * self.message.cost.get()) {
-                    let midstate = &hmac_state[(r % 2) as usize];
-
-                    let mut state = *midstate;
-
-                    crate::sha256::avx2::multiway_arx::<0>(&mut state, &mut blocks);
-
-                    blocks = [
-                        _mm256_add_epi32(state[0], midstate[0]),
-                        _mm256_add_epi32(state[1], midstate[1]),
-                        _mm256_add_epi32(state[2], midstate[2]),
-                        _mm256_add_epi32(state[3], midstate[3]),
-                        _mm256_add_epi32(state[4], midstate[4]),
-                        _mm256_add_epi32(state[5], midstate[5]),
-                        _mm256_add_epi32(state[6], midstate[6]),
-                        _mm256_add_epi32(state[7], midstate[7]),
-                        _mm256_set1_epi32(i32::from_be_bytes([0x80, 0, 0, 0]) as _),
-                        _mm256_setzero_si256(),
-                        _mm256_setzero_si256(),
-                        _mm256_setzero_si256(),
-                        _mm256_setzero_si256(),
-                        _mm256_setzero_si256(),
-                        _mm256_setzero_si256(),
-                        _mm256_set1_epi32(512 + 256),
-                    ];
-
-                    if r % 2 == 1 {
-                        for i in 0..8 {
-                            result[i] = _mm256_xor_si256(result[i], blocks[i]);
-                        }
-                    }
-                }
-
-                let cmp_fn = |x: __m256i, y: __m256i| {
-                    let bias = _mm256_set1_epi32(i32::MIN);
-                    if TYPE == crate::solver::SOLVE_TYPE_GT {
-                        _mm256_cmpgt_epi32(_mm256_add_epi32(x, bias), _mm256_add_epi32(y, bias))
-                    } else if TYPE == crate::solver::SOLVE_TYPE_LT {
-                        _mm256_cmpgt_epi32(_mm256_add_epi32(y, bias), _mm256_add_epi32(x, bias))
-                    } else {
-                        _mm256_cmpeq_epi32(
-                            _mm256_and_si256(x, _mm256_set1_epi32((mask >> 32) as _)),
-                            y,
-                        )
-                    }
-                };
-                let met_target = cmp_fn(result[0], _mm256_set1_epi32((target >> 32) as _));
-                let nothit = _mm256_testz_si256(met_target, met_target);
-
-                if nothit == 0 {
-                    crate::unlikely();
-
-                    let success_lane_idx = {
-                        let mut dump = Align64([0u32; 8]);
-                        _mm256_store_si256(dump.as_mut_ptr().cast(), met_target);
-                        dump.0.iter().position(|x| *x != 0).unwrap()
-                    };
-                    let perm = _mm256_set1_epi32(success_lane_idx as _);
+                if r % 2 == 1 {
                     for i in 0..8 {
-                        result[i] = _mm256_permutexvar_epi32(perm, result[i]);
+                        result[i] = _mm256_xor_si256(result[i], blocks[i]);
                     }
-                    return Some((
-                        counter as u64 + success_lane_idx as u64,
-                        core::array::from_fn(|i| {
-                            _mm_extract_epi32(_mm256_castsi256_si128(result[i]), 0) as u32
-                        }),
-                    ));
                 }
-
-                self.attempted_nonces += 8;
-
-                //core::arch::asm!("# LLVM-MCA-END altcha_pbkdf2_impl",);
             }
+
+            self.attempted_nonces += 8;
+            if let Some(success_lane_idx) =
+                find_sha256_target_lane::<TYPE>(result[0], result[1], target, mask)
+            {
+                crate::unlikely();
+                let perm = _mm256_set1_epi32(success_lane_idx as _);
+                for i in 0..8 {
+                    result[i] = _mm256_permutevar8x32_epi32(result[i], perm);
+                }
+                return Some((
+                    counter as u64 + success_lane_idx as u64,
+                    core::array::from_fn(|i| {
+                        _mm_extract_epi32(_mm256_castsi256_si128(result[i]), 0) as u32
+                    }),
+                ));
+            }
+
+            //core::arch::asm!("# LLVM-MCA-END altcha_pbkdf2_impl",);
         }
 
         None
+    }
+
+    fn solve_fallback<const TYPE: u8>(
+        &mut self,
+        target: u64,
+        mask: u64,
+    ) -> Option<(u64, [u32; 8])> {
+        let mut fallback = crate::solver::safe::AltchaSha256Solver::from(self.message.clone());
+        crate::solver::Solver::set_limit(
+            &mut fallback,
+            self.limit.saturating_sub(self.attempted_nonces),
+        );
+        let result = crate::solver::Solver::solve::<TYPE>(&mut fallback, target, mask);
+        self.attempted_nonces = self
+            .attempted_nonces
+            .saturating_add(crate::solver::Solver::get_attempted_nonces(&fallback));
+        result
     }
 }
 
@@ -1719,20 +2139,26 @@ impl crate::solver::Solver for AltchaSha256Solver {
     }
 
     fn solve<const TYPE: u8>(&mut self, target: u64, mask: u64) -> Option<(u64, [u32; 8])> {
+        if !<RequiredFeatures as crate::solver::CpuIDToken>::get() {
+            return self.solve_fallback::<TYPE>(target, mask);
+        }
         if self.message.pbkdf2 {
-            self.solve_pbkdf2_impl::<TYPE>(target, mask)
+            // SAFETY: <RequiredFeatures as crate::solver::CpuIDToken>::get() above proves AVX2 is available.
+            unsafe { self.solve_pbkdf2_impl::<TYPE>(target, mask) }
         } else {
-            match self.message.key_length.get().min(32) {
-                4 => self.solve_nested_impl::<TYPE, 1>(target, mask),
-                8 => self.solve_nested_impl::<TYPE, 2>(target, mask),
-                12 => self.solve_nested_impl::<TYPE, 3>(target, mask),
-                16 => self.solve_nested_impl::<TYPE, 4>(target, mask),
-                20 => self.solve_nested_impl::<TYPE, 5>(target, mask),
-                24 => self.solve_nested_impl::<TYPE, 6>(target, mask),
-                28 => self.solve_nested_impl::<TYPE, 7>(target, mask),
-                32 => self.solve_nested_impl::<TYPE, 8>(target, mask),
-                // weird config, likely not used in reality
-                _ => None,
+            // SAFETY: <RequiredFeatures as crate::solver::CpuIDToken>::get() above proves AVX2 is available.
+            unsafe {
+                match self.message.key_length.get().min(32) {
+                    4 => self.solve_nested_impl::<TYPE, 1>(target, mask),
+                    8 => self.solve_nested_impl::<TYPE, 2>(target, mask),
+                    12 => self.solve_nested_impl::<TYPE, 3>(target, mask),
+                    16 => self.solve_nested_impl::<TYPE, 4>(target, mask),
+                    20 => self.solve_nested_impl::<TYPE, 5>(target, mask),
+                    24 => self.solve_nested_impl::<TYPE, 6>(target, mask),
+                    28 => self.solve_nested_impl::<TYPE, 7>(target, mask),
+                    32 => self.solve_nested_impl::<TYPE, 8>(target, mask),
+                    _ => return self.solve_fallback::<TYPE>(target, mask),
+                }
             }
         }
     }
@@ -1742,8 +2168,19 @@ impl crate::solver::Solver for AltchaSha256Solver {
 #[cfg(test)]
 mod tests {
     use crate::message::{CerberusBinaryMessage, CerberusDecimalMessage};
+    use crate::solver::Solver as _;
 
     use super::*;
+    #[test]
+    fn test_permute_lane_extraction_order() {
+        let values = unsafe { _mm256_setr_epi32(10, 11, 12, 13, 14, 15, 16, 17) };
+        for lane in 0..8 {
+            let index = unsafe { _mm256_set1_epi32(lane) };
+            let selected = unsafe { _mm256_permutevar8x32_epi32(values, index) };
+            assert_eq!(unsafe { _mm256_extract_epi32::<0>(selected) }, 10 + lane);
+        }
+    }
+
     #[test]
     fn test_decimal_lane_prefix_mapping() {
         for prefix_set_index in 0..11 {
@@ -1762,8 +2199,6 @@ mod tests {
 
     #[test]
     fn test_single_block_attempt_accounting() {
-        use crate::solver::Solver as _;
-
         let message = SingleBlockMessage::new(&[b'a'; 64], 0).expect("single block");
         let mut solver = SingleBlockSolver::from(message);
         solver.set_limit(8);
@@ -1773,6 +2208,37 @@ mod tests {
                 .is_none()
         );
         assert_eq!(solver.get_attempted_nonces(), 8);
+    }
+
+    #[cfg(feature = "compare-64bit")]
+    #[test]
+    fn test_full64_lt_comparisons() {
+        const TARGET: u64 = 1u64 << 63;
+        fn check<S: crate::solver::Solver<Output = [u32; 8]>>(mut solver: S) {
+            solver.set_limit(1_000_000);
+            let (_, hash) = solver
+                .solve::<{ crate::solver::SOLVE_TYPE_LT }>(TARGET, u64::MAX)
+                .expect("full-width LT solver should find an easy target");
+            let value = (u64::from(hash[0]) << 32) | u64::from(hash[1]);
+            assert!(value < TARGET, "{value:#018x} is not below {TARGET:#018x}");
+        }
+
+        let salt = [b'a'; 64];
+        check(SingleBlockSolver::from(
+            SingleBlockMessage::new(&salt, 0).expect("single block"),
+        ));
+        let double = (0..64)
+            .find_map(|len| DoubleBlockMessage::new(&salt[..len], 0))
+            .expect("double block shape");
+        check(DoubleBlockSolver::from(double));
+        check(BinarySolver::from(BinaryMessage::new(
+            &salt,
+            4.try_into().unwrap(),
+        )));
+        check(GoAwaySolver::from(GoAwayMessage::new_bytes(
+            (&salt[..32]).try_into().unwrap(),
+            0,
+        )));
     }
 
     #[test]
@@ -1803,6 +2269,15 @@ mod tests {
             });
         }
     }
+    #[test]
+    fn test_solve_binary() {
+        crate::solver::tests::test_binary_validator::<BinarySolver, _>(
+            |prefix, nonce_byte_count| {
+                BinarySolver::from(BinaryMessage::new(prefix, nonce_byte_count))
+            },
+        )
+    }
+
     #[test]
     fn test_solve_goaway() {
         crate::solver::tests::test_goaway_validator::<GoAwaySolver, _>(|prefix| {

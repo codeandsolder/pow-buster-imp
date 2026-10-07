@@ -44,6 +44,9 @@ impl SingleBlockSolver {
 
         for nonzero_digit in 1..=9 {
             for key in 0..100_000_000 {
+                if self.attempted_nonces >= self.limit {
+                    return None;
+                }
                 let mut key_copy = key;
 
                 if NO_TRAILING_ZEROS {
@@ -169,7 +172,7 @@ impl crate::solver::Solver for DoubleBlockSolver {
             for j in (0..9).rev() {
                 let digit = key_copy % 10;
                 key_copy /= 10;
-                buffer[DoubleBlockMessage::DIGIT_IDX as usize + j] = digit as u8 + b'0'; // TODO: fix this
+                buffer[DoubleBlockMessage::DIGIT_IDX as usize + j] = digit as u8 + b'0';
             }
 
             let mut state = self.message.prefix_state;
@@ -206,8 +209,6 @@ impl crate::solver::Solver for DoubleBlockSolver {
                 sha2::compress256(&mut state, &[buffer, buffer2]);
                 return Some((key as u64 + self.message.nonce_addend, *state));
             }
-
-            self.attempted_nonces += 1;
 
             if self.attempted_nonces >= self.limit {
                 return None;
@@ -385,6 +386,7 @@ impl crate::solver::Solver for BinarySolver {
             }
 
             sha2::compress256(&mut state, &used_blocks);
+            self.attempted_nonces += 1;
 
             let cmp_fn = |x: u64, y: u64| {
                 if TYPE == crate::solver::SOLVE_TYPE_GT {
@@ -398,8 +400,6 @@ impl crate::solver::Solver for BinarySolver {
             if cmp_fn((state[0] as u64) << 32 | (state[1] as u64), target) {
                 return Some((x, state.0));
             }
-
-            self.attempted_nonces += 1;
 
             if self.attempted_nonces >= self.limit {
                 return None;
@@ -551,6 +551,9 @@ impl AltchaSha256Solver {
         let key_length = (self.message.key_length.get() as u32).min(32);
 
         for counter in 0u32.. {
+            if self.attempted_nonces >= self.limit {
+                return None;
+            }
             let mut state = crate::sha256::IV;
             blocks[32..(32 + 4)].copy_from_slice(&counter.to_be_bytes());
             sha2::compress256(&mut state, core::array::from_ref(&blocks));
@@ -566,9 +569,6 @@ impl AltchaSha256Solver {
                 sha2::compress256(&mut state, core::array::from_ref(&subblocks));
             }
             self.attempted_nonces += 1;
-            if self.attempted_nonces >= self.limit {
-                return None;
-            }
             let cmp64_fn = |x: u64, y: u64| {
                 if TYPE == crate::solver::SOLVE_TYPE_GT {
                     x > y
@@ -594,6 +594,9 @@ impl AltchaSha256Solver {
         let mut password = [0; 16 + 4];
         password[..16].copy_from_slice(&self.message.nonce);
         for counter in 0u32.. {
+            if self.attempted_nonces >= self.limit {
+                return None;
+            }
             password[16..16 + 4].copy_from_slice(&counter.to_be_bytes());
             pbkdf2::pbkdf2::<pbkdf2::hmac::Hmac<sha2::Sha256>>(
                 &password,
@@ -603,9 +606,6 @@ impl AltchaSha256Solver {
             )
             .unwrap();
             self.attempted_nonces += 1;
-            if self.attempted_nonces >= self.limit {
-                return None;
-            }
             let cmp64_fn = |x: u64, y: u64| {
                 if TYPE == crate::solver::SOLVE_TYPE_GT {
                     x > y
@@ -727,6 +727,43 @@ mod tests {
                 0,
             ))
         });
+    }
+
+    #[test]
+    fn test_exact_attempt_limits() {
+        fn exhaust_one<S: crate::solver::Solver<Output = [u32; 8]>>(mut solver: S) {
+            solver.set_limit(1);
+            assert!(
+                solver
+                    .solve::<{ crate::solver::SOLVE_TYPE_LT }>(0, u64::MAX)
+                    .is_none()
+            );
+            assert_eq!(solver.get_attempted_nonces(), 1);
+        }
+
+        let salt = [b'a'; 64];
+        exhaust_one(SingleBlockSolver::from(
+            SingleBlockMessage::new(&salt, 0).expect("single block"),
+        ));
+        let double = (0..64)
+            .find_map(|len| DoubleBlockMessage::new(&salt[..len], 0))
+            .expect("double block shape");
+        exhaust_one(DoubleBlockSolver::from(double));
+        exhaust_one(BinarySolver::from(BinaryMessage::new(
+            &salt,
+            4.try_into().unwrap(),
+        )));
+        exhaust_one(GoAwaySolver::from(GoAwayMessage::new_bytes(
+            (&salt[..32]).try_into().unwrap(),
+            0,
+        )));
+        exhaust_one(AltchaSha256Solver::from(AltchaMessage {
+            nonce: [1; 16],
+            salt: [2; 16],
+            cost: 1.try_into().unwrap(),
+            pbkdf2: false,
+            key_length: 32.try_into().unwrap(),
+        }));
     }
 
     #[test]

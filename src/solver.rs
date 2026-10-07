@@ -24,9 +24,13 @@ pub const SOLVE_TYPE_GT: u8 = 2;
 /// Mask test (such as Cap.js)
 pub const SOLVE_TYPE_MASK: u8 = 4;
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub(crate) const HMAC_IPAD: u8 = 0x36;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub(crate) const HMAC_IPAD32: u32 = u32::from_be_bytes([HMAC_IPAD; 4]);
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub(crate) const HMAC_OPAD: u8 = 0x5c;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub(crate) const HMAC_OPAD32: u32 = u32::from_be_bytes([HMAC_OPAD; 4]);
 
 /// A token for checking CPU features

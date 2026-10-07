@@ -569,10 +569,24 @@ impl DoubleBlockSolver {
 
         let target = target & mask;
 
-        for i in (DoubleBlockMessage::DIGIT_IDX as usize..).take(9) {
+        // The first two decimal digits are supplied by the SHA-NI lanes. Keep the remaining
+        // seven digits directly in the message and advance them as an ASCII decimal odometer.
+        // This preserves the full decimal search order while avoiding seven div/mod operations
+        // and seven stores for every four candidate hashes.
+        {
             let message = decompose_blocks_mut(&mut self.message.message);
-            message[SWAP_DWORD_BYTE_ORDER[i]] = b'0';
+            for logical_idx in (DoubleBlockMessage::DIGIT_IDX as usize + 2)..63 {
+                message[SWAP_DWORD_BYTE_ORDER[logical_idx]] = b'0';
+            }
         }
+
+        // Keep the candidate block alive across iterations. Only the seven mutable
+        // ASCII digits change in the hot loop; rebuilding/copying the other 13 words
+        // every four hashes is pure input-generation overhead.
+        let mut msg0 = Align16([0; 16]);
+        msg0[..13].copy_from_slice(&self.message.message[..13]);
+        msg0[14] = self.message.message[14];
+        msg0[15] = self.message.message[15];
 
         let iv_state = crate::sha256::sha_ni::prepare_state(&self.message.prefix_state);
         let mut prefix_state = Align16(self.message.prefix_state);
@@ -584,152 +598,128 @@ impl DoubleBlockSolver {
         terminal_message[15] = (self.message.message_length * 8) as u32;
 
         for nonce_prefix_start in (10u32..=96).step_by(4) {
-            unsafe {
-                const fn to_ascii_u32(input: u32) -> u32 {
-                    let high_digit = input / 10;
-                    let low_digit = input % 10;
-                    u32::from_be_bytes([0, 0, high_digit as u8 + b'0', low_digit as u8 + b'0'])
+            const fn to_ascii_u32(input: u32) -> u32 {
+                let high_digit = input / 10;
+                let low_digit = input % 10;
+                u32::from_be_bytes([0, 0, high_digit as u8 + b'0', low_digit as u8 + b'0'])
+            }
+            let lane_index_value_v = [
+                to_ascii_u32(nonce_prefix_start) | self.message.message[13],
+                to_ascii_u32(nonce_prefix_start + 1) | self.message.message[13],
+                to_ascii_u32(nonce_prefix_start + 2) | self.message.message[13],
+                to_ascii_u32(nonce_prefix_start + 3) | self.message.message[13],
+            ];
+
+            for inner_key in 0..10_000_000u64 {
+                let mut states0 = prepared_state;
+                let mut states1 = prepared_state;
+                let mut states2 = prepared_state;
+                let mut states3 = prepared_state;
+
+                struct LaneIdPlucker<'a> {
+                    lane_index_value_v: &'a [u32; 4],
                 }
-                let lane_index_value_v = [
-                    to_ascii_u32(nonce_prefix_start) | self.message.message[13],
-                    to_ascii_u32(nonce_prefix_start + 1) | self.message.message[13],
-                    to_ascii_u32(nonce_prefix_start + 2) | self.message.message[13],
-                    to_ascii_u32(nonce_prefix_start + 3) | self.message.message[13],
+                impl<'a> crate::sha256::sha_ni::Plucker for LaneIdPlucker<'a> {
+                    #[inline(always)]
+                    fn pluck_qword3(&mut self, lane: usize, w: &mut __m128i) {
+                        *w = unsafe {
+                            _mm_or_si128(
+                                *w,
+                                _mm_setr_epi32(0, self.lane_index_value_v[lane] as _, 0, 0),
+                            )
+                        };
+                    }
+                }
+
+                crate::sha256::sha_ni::multiway_arx_abef_cdgh::<3, 4, LaneIdPlucker>(
+                    [&mut states0, &mut states1, &mut states2, &mut states3],
+                    &msg0,
+                    LaneIdPlucker {
+                        lane_index_value_v: &lane_index_value_v,
+                    },
+                );
+
+                for s in [&mut states0, &mut states1, &mut states2, &mut states3] {
+                    s.iter_mut()
+                        .zip(iv_state.iter())
+                        .for_each(|(state, iv_state)| {
+                            *state = _mm_add_epi32(*state, *iv_state);
+                        });
+                }
+
+                let save_abs = [states0[0], states1[0], states2[0], states3[0]];
+
+                // this isn't really SIMD so we can't really amortize the cost of fetching message schedule
+                // so let's compute it with sha-ni
+                crate::sha256::sha_ni::multiway_arx_abef_cdgh::<0, 4, _>(
+                    [&mut states0, &mut states1, &mut states2, &mut states3],
+                    &terminal_message,
+                    (),
+                );
+
+                states0[0] = _mm_add_epi32(states0[0], save_abs[0]);
+                states1[0] = _mm_add_epi32(states1[0], save_abs[1]);
+                states2[0] = _mm_add_epi32(states2[0], save_abs[2]);
+                states3[0] = _mm_add_epi32(states3[0], save_abs[3]);
+
+                let final_abs = [
+                    _mm_extract_epi64(states0[0], 1) as u64,
+                    _mm_extract_epi64(states1[0], 1) as u64,
+                    _mm_extract_epi64(states2[0], 1) as u64,
+                    _mm_extract_epi64(states3[0], 1) as u64,
                 ];
 
-                for inner_key in 0..10_000_000 {
-                    let mut states0 = prepared_state;
-                    let mut states1 = prepared_state;
-                    let mut states2 = prepared_state;
-                    let mut states3 = prepared_state;
-
-                    let mut key_copy = inner_key;
-                    let mut cum0 = 0;
-                    for _ in 0..4 {
-                        cum0 <<= 8;
-                        cum0 |= key_copy % 10;
-                        key_copy /= 10;
+                let cmp_fn = |x: &u64, y: &u64| {
+                    if TYPE == crate::solver::SOLVE_TYPE_GT {
+                        x > y
+                    } else if TYPE == crate::solver::SOLVE_TYPE_LT {
+                        x < y
+                    } else {
+                        x & mask == y & mask
                     }
-                    cum0 |= u32::from_be_bytes(*b"0000");
-                    let mut cum1 = 0;
-                    for _ in 0..3 {
-                        cum1 += key_copy % 10;
-                        cum1 <<= 8;
-                        key_copy /= 10;
-                    }
-                    cum1 |= u32::from_be_bytes(*b"000\x80");
+                };
 
-                    if key_copy != 0 {
-                        debug_assert_eq!(key_copy, 0);
-                        core::hint::unreachable_unchecked();
-                    }
+                let success_lane_idx = final_abs.iter().position(|x| cmp_fn(x, &target));
 
-                    let mut msg0 = Align16([0; 16]);
-                    msg0[..13].copy_from_slice(self.message.message[..13].try_into().unwrap());
-                    msg0[14] = cum0;
-                    msg0[15] = cum1;
+                if let Some(success_lane_idx) = success_lane_idx {
+                    crate::unlikely();
 
-                    struct LaneIdPlucker<'a> {
-                        lane_index_value_v: &'a [u32; 4],
-                    }
-                    impl<'a> crate::sha256::sha_ni::Plucker for LaneIdPlucker<'a> {
-                        #[inline(always)]
-                        fn pluck_qword3(&mut self, lane: usize, w: &mut __m128i) {
-                            *w = unsafe {
-                                _mm_or_si128(
-                                    *w,
-                                    _mm_setr_epi32(0, self.lane_index_value_v[lane] as _, 0, 0),
-                                )
-                            };
+                    let nonce_prefix = nonce_prefix_start + success_lane_idx as u32;
+                    self.message.message[13] = lane_index_value_v[success_lane_idx];
+                    self.message.message[14] = msg0[14];
+                    self.message.message[15] = msg0[15];
+
+                    // recompute the hash from the beginning
+                    // this prevents the compiler from having to compute the final B-H registers alive in tight loops
+                    let mut final_sha_state = self.message.prefix_state;
+                    crate::sha256::digest_block(&mut final_sha_state, &self.message.message);
+                    crate::sha256::digest_block(&mut final_sha_state, &terminal_message);
+
+                    let computed_nonce =
+                        nonce_prefix as u64 * 10u64.pow(7) + inner_key + self.message.nonce_addend;
+
+                    // the nonce is the 8 digits in the message, plus the first two digits recomputed from the lane index
+                    return Some((computed_nonce, *final_sha_state));
+                }
+
+                // Advance the seven mutable decimal bytes in-place. Carries are rare, so
+                // this touches 10/9 bytes on average instead of rebuilding all seven digits.
+                {
+                    let message = decompose_blocks_mut(&mut msg0);
+                    for logical_idx in ((DoubleBlockMessage::DIGIT_IDX as usize + 2)..63).rev() {
+                        let physical_idx = SWAP_DWORD_BYTE_ORDER[logical_idx];
+                        if message[physical_idx] != b'9' {
+                            message[physical_idx] += 1;
+                            break;
                         }
+                        message[physical_idx] = b'0';
                     }
+                }
 
-                    crate::sha256::sha_ni::multiway_arx_abef_cdgh::<3, 4, LaneIdPlucker>(
-                        [&mut states0, &mut states1, &mut states2, &mut states3],
-                        &msg0,
-                        LaneIdPlucker {
-                            lane_index_value_v: &lane_index_value_v,
-                        },
-                    );
+                self.attempted_nonces += 4;
 
-                    for s in [&mut states0, &mut states1, &mut states2, &mut states3] {
-                        s.iter_mut()
-                            .zip(iv_state.iter())
-                            .for_each(|(state, iv_state)| {
-                                *state = _mm_add_epi32(*state, *iv_state);
-                            });
-                    }
-
-                    let save_abs = [states0[0], states1[0], states2[0], states3[0]];
-
-                    // this isn't really SIMD so we can't really amortize the cost of fetching message schedule
-                    // so let's compute it with sha-ni
-                    crate::sha256::sha_ni::multiway_arx_abef_cdgh::<0, 4, _>(
-                        [&mut states0, &mut states1, &mut states2, &mut states3],
-                        &terminal_message,
-                        (),
-                    );
-
-                    states0[0] = _mm_add_epi32(states0[0], save_abs[0]);
-                    states1[0] = _mm_add_epi32(states1[0], save_abs[1]);
-                    states2[0] = _mm_add_epi32(states2[0], save_abs[2]);
-                    states3[0] = _mm_add_epi32(states3[0], save_abs[3]);
-
-                    let final_abs = [
-                        _mm_extract_epi64(states0[0], 1) as u64,
-                        _mm_extract_epi64(states1[0], 1) as u64,
-                        _mm_extract_epi64(states2[0], 1) as u64,
-                        _mm_extract_epi64(states3[0], 1) as u64,
-                    ];
-
-                    let cmp_fn = |x: &u64, y: &u64| {
-                        if TYPE == crate::solver::SOLVE_TYPE_GT {
-                            x > y
-                        } else if TYPE == crate::solver::SOLVE_TYPE_LT {
-                            x < y
-                        } else {
-                            x & mask == y & mask
-                        }
-                    };
-
-                    let success_lane_idx = final_abs.iter().position(|x| cmp_fn(x, &target));
-
-                    if let Some(success_lane_idx) = success_lane_idx {
-                        crate::unlikely();
-
-                        let nonce_prefix = nonce_prefix_start + success_lane_idx as u32;
-                        self.message.message[13] = lane_index_value_v[success_lane_idx];
-                        self.message.message[14] = cum0;
-                        self.message.message[15] = cum1;
-
-                        // recompute the hash from the beginning
-                        // this prevents the compiler from having to compute the final B-H registers alive in tight loops
-                        let mut final_sha_state = self.message.prefix_state;
-                        crate::sha256::digest_block(&mut final_sha_state, &self.message.message);
-                        crate::sha256::digest_block(&mut final_sha_state, &terminal_message);
-
-                        // reverse the byte order
-                        let mut nonce_suffix = 0;
-                        let mut key_copy = inner_key;
-                        for _ in 0..7 {
-                            nonce_suffix *= 10;
-                            nonce_suffix += key_copy % 10;
-                            key_copy /= 10;
-                        }
-
-                        let computed_nonce = nonce_prefix as u64 * 10u64.pow(7)
-                            + nonce_suffix as u64
-                            + self.message.nonce_addend;
-
-                        // the nonce is the 8 digits in the message, plus the first two digits recomputed from the lane index
-                        return Some((computed_nonce, *final_sha_state));
-                    }
-
-                    self.attempted_nonces += 4;
-
-                    if self.attempted_nonces >= self.limit {
-                        return None;
-                    }
+                if self.attempted_nonces >= self.limit {
+                    return None;
                 }
             }
         }
