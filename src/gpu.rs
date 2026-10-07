@@ -61,12 +61,14 @@ pub struct GpuContext {
     in_buf: wgpu::Buffer,
     generic_pipeline: wgpu::ComputePipeline,
     multi_pipeline: wgpu::ComputePipeline,
+    cerberus_pipeline: wgpu::ComputePipeline,
     generic_in_buf: wgpu::Buffer,
     out_buf: wgpu::Buffer,
     staging: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     generic_bind_group: wgpu::BindGroup,
     multi_bind_group: wgpu::BindGroup,
+    cerberus_bind_group: wgpu::BindGroup,
     max_wgs: u32,
     adapter: String,
 }
@@ -122,6 +124,18 @@ impl GpuContext {
             label: Some("pow-buster-sha256-multi-layout"),
             layout: None,
             module: &multi_shader,
+            entry_point: Some("solve"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let cerberus_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("pow-buster-cerberus"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(cerberus_shader_source())),
+        });
+        let cerberus_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("pow-buster-cerberus"),
+            layout: None,
+            module: &cerberus_shader,
             entry_point: Some("solve"),
             compilation_options: Default::default(),
             cache: None,
@@ -194,6 +208,20 @@ impl GpuContext {
                 },
             ],
         });
+        let cerberus_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("pow-buster-cerberus"),
+            layout: &cerberus_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: generic_in_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: out_buf.as_entire_binding(),
+                },
+            ],
+        });
 
         Ok(Self {
             device,
@@ -202,12 +230,14 @@ impl GpuContext {
             in_buf,
             generic_pipeline,
             multi_pipeline,
+            cerberus_pipeline,
             generic_in_buf,
             out_buf,
             staging,
             bind_group,
             generic_bind_group,
             multi_bind_group,
+            cerberus_bind_group,
             max_wgs: limits.max_compute_workgroups_per_dimension,
             adapter: adapter_name,
         })
@@ -595,6 +625,41 @@ impl GpuContext {
         let hash = values[3..11]
             .try_into()
             .map_err(|_| GpuError::new("invalid GPU result layout"))?;
+        Ok(Some((nonce, hash)))
+    }
+
+    async fn dispatch_cerberus(
+        &mut self,
+        params: &[u32; 64],
+        workgroups: u32,
+    ) -> Result<Option<(u64, [u32; 8])>, GpuError> {
+        self.queue.write_buffer(&self.out_buf, 0, &[0; 48]);
+        self.queue
+            .write_buffer(&self.generic_in_buf, 0, bytemuck::cast_slice(params));
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("pow-buster-cerberus"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("pow-buster-cerberus"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.cerberus_pipeline);
+            pass.set_bind_group(0, &self.cerberus_bind_group, &[]);
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&self.out_buf, 0, &self.staging, 0, 48);
+        self.queue.submit([encoder.finish()]);
+        let values = self.read_result().await?;
+        if values[0] == 0 {
+            return Ok(None);
+        }
+        let nonce = (u64::from(values[2]) << 32) | u64::from(values[1]);
+        let hash = values[3..11]
+            .try_into()
+            .map_err(|_| GpuError::new("invalid GPU Cerberus result layout"))?;
         Ok(Some((nonce, hash)))
     }
 
@@ -1015,6 +1080,119 @@ impl BinarySolver {
     }
 }
 
+/// Async GPU counterpart of the CPU Cerberus BLAKE3 solver.
+pub struct CerberusSolver {
+    message: crate::message::CerberusMessage,
+    attempted_nonces: u64,
+    limit: u64,
+}
+
+impl From<crate::message::CerberusMessage> for CerberusSolver {
+    fn from(message: crate::message::CerberusMessage) -> Self {
+        Self {
+            message,
+            attempted_nonces: 0,
+            limit: u64::MAX,
+        }
+    }
+}
+
+impl CerberusSolver {
+    /// Set the maximum number of candidates dispatched.
+    pub fn set_limit(&mut self, limit: u64) {
+        self.limit = limit;
+    }
+
+    /// Number of candidates dispatched so far.
+    pub fn get_attempted_nonces(&self) -> u64 {
+        self.attempted_nonces
+    }
+
+    /// Solve a Cerberus message on the GPU.
+    ///
+    /// Cerberus uses a zero target plus bit mask; this mirrors the CPU backend.
+    pub async fn solve<const TYPE: u8>(
+        &mut self,
+        gpu: &mut GpuContext,
+        target: u64,
+        mask: u64,
+    ) -> Result<Option<GpuSolution>, GpuError> {
+        if target != 0 {
+            return Err(GpuError::new("Cerberus GPU solver requires target == 0"));
+        }
+        let _ = TYPE;
+        let expected = 1_u64.checked_shl(mask.count_ones()).unwrap_or(u64::MAX);
+        let desired = expected.saturating_mul(8).max(HASHES_PER_WG);
+        let search_space = match &self.message {
+            crate::message::CerberusMessage::Decimal(_) => 1_000_000_000_u64,
+            crate::message::CerberusMessage::Binary(_) => u64::from(u32::MAX),
+        };
+        let limit = self.limit.min(search_space);
+        let mut base = 0_u64;
+
+        while base < limit {
+            let batch = desired
+                .min(limit - base)
+                .min(u64::from(gpu.max_wgs) * HASHES_PER_WG)
+                .min(u64::from(u32::MAX));
+            let wgs = batch.div_ceil(HASHES_PER_WG).max(1) as u32;
+            let mut p = [0_u32; 64];
+            p[1] = base as u32;
+            p[2] = batch as u32;
+            p[3] = (mask >> 32) as u32;
+            p[4] = mask as u32;
+
+            match &self.message {
+                crate::message::CerberusMessage::Decimal(message) => {
+                    p[0] = 0;
+                    p[8..16].copy_from_slice(&message.prefix_state.0);
+                    for (i, chunk) in message.salt_residual.chunks_exact(4).enumerate() {
+                        p[16 + i] = u32::from_le_bytes(chunk.try_into().unwrap());
+                    }
+                    p[32] = message.salt_residual_len as u32;
+                    p[33] = message.salt_residual_len as u32 + 9;
+                    p[34] = message.flags;
+                    p[35] = message.nonce_addend as u32;
+                    p[36] = (message.nonce_addend >> 32) as u32;
+                }
+                crate::message::CerberusMessage::Binary(message) => {
+                    p[0] = 1;
+                    p[8..16].copy_from_slice(&message.midstate.0);
+                    p[16] = message.first_word;
+                }
+            }
+
+            if let Some((nonce, hash)) = gpu.dispatch_cerberus(&p, wgs).await? {
+                self.attempted_nonces = base + batch;
+                if !verify_cerberus(&self.message, nonce, hash, mask) {
+                    return Err(GpuError::new("GPU returned an invalid Cerberus proof"));
+                }
+                return Ok(Some(GpuSolution {
+                    nonce,
+                    hash,
+                    dispatched_hashes: self.attempted_nonces,
+                }));
+            }
+            base += batch;
+        }
+        self.attempted_nonces = limit;
+        Ok(None)
+    }
+
+    /// Solve and return only the nonce.
+    pub async fn solve_nonce_only<const TYPE: u8>(
+        &mut self,
+        gpu: &mut GpuContext,
+        target: u64,
+        mask: u64,
+    ) -> Result<Option<u64>, GpuError> {
+        Ok(self
+            .solve::<TYPE>(gpu, target, mask)
+            .await?
+            .map(|solution| solution.nonce))
+    }
+}
+
 fn single_block_search_space(message: &crate::message::SingleBlockMessage) -> u64 {
     if message.nonce_addend == 0 {
         900_000_000
@@ -1173,6 +1351,116 @@ fn verify_fast_single_block(
     let mut state = message.prefix_state;
     crate::sha256::digest_block(&mut state, &words);
     state == hash && result_matches::<{ crate::solver::SOLVE_TYPE_MASK }>(hash, 0, mask)
+}
+
+fn verify_cerberus(
+    message: &crate::message::CerberusMessage,
+    nonce: u64,
+    hash: [u32; 8],
+    mask: u64,
+) -> bool {
+    let expected = match message {
+        crate::message::CerberusMessage::Decimal(message) => {
+            let Some(mut suffix) = nonce.checked_sub(message.nonce_addend) else {
+                return false;
+            };
+            if suffix >= 1_000_000_000 {
+                return false;
+            }
+            let mut bytes = message.salt_residual.0;
+            for i in (0..9).rev() {
+                bytes[message.salt_residual_len + i] = (suffix % 10) as u8 + b'0';
+                suffix /= 10;
+            }
+            let words = core::array::from_fn(|i| {
+                u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
+            });
+            crate::blake3::compress8(
+                &message.prefix_state.0,
+                &words,
+                0,
+                message.salt_residual_len as u32 + 9,
+                message.flags,
+            )
+        }
+        crate::message::CerberusMessage::Binary(message) => {
+            if (nonce >> 32) as u32 != message.first_word {
+                return false;
+            }
+            let mut words = [0_u32; 16];
+            words[0] = message.first_word;
+            words[1] = nonce as u32;
+            crate::blake3::compress8(
+                &message.midstate.0,
+                &words,
+                0,
+                8,
+                crate::blake3::FLAG_CHUNK_END | crate::blake3::FLAG_ROOT,
+            )
+        }
+    };
+    expected == hash && ((((hash[0] as u64) << 32) | u64::from(hash[1])) & mask) == 0
+}
+
+fn cerberus_shader_source() -> String {
+    const PERM: [usize; 16] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
+    let mut schedule = [[0_usize; 16]; 7];
+    schedule[0] = core::array::from_fn(|i| i);
+    for round in 1..7 {
+        schedule[round] = core::array::from_fn(|i| schedule[round - 1][PERM[i]]);
+    }
+    let mut rounds = String::new();
+    let gs = [
+        (0, 4, 8, 12, 0, 1),
+        (1, 5, 9, 13, 2, 3),
+        (2, 6, 10, 14, 4, 5),
+        (3, 7, 11, 15, 6, 7),
+        (0, 5, 10, 15, 8, 9),
+        (1, 6, 11, 12, 10, 11),
+        (2, 7, 8, 13, 12, 13),
+        (3, 4, 9, 14, 14, 15),
+    ];
+    for sched in &schedule {
+        for &(a, b, c, d, x, y) in &gs {
+            let mx = sched[x];
+            let my = sched[y];
+            rounds.push_str(&format!(
+                "v[{a}]=v[{a}]+v[{b}]+m[{mx}];v[{d}]=rotr(v[{d}]^v[{a}],16u);v[{c}]=v[{c}]+v[{d}];v[{b}]=rotr(v[{b}]^v[{c}],12u);v[{a}]=v[{a}]+v[{b}]+m[{my}];v[{d}]=rotr(v[{d}]^v[{a}],8u);v[{c}]=v[{c}]+v[{d}];v[{b}]=rotr(v[{b}]^v[{c}],7u);\n"
+            ));
+        }
+    }
+    format!(
+        r#"
+struct OutBuf {{ flag:atomic<u32>,nonce_lo:u32,nonce_hi:u32,hash:array<u32,8> }};
+@group(0) @binding(0) var<storage,read> P:array<u32>;
+@group(0) @binding(1) var<storage,read_write> R:OutBuf;
+fn rotr(x:u32,n:u32)->u32{{return (x>>n)|(x<<(32u-n));}}
+fn compress(cv:array<u32,8>,m:array<u32,16>,blen:u32,flags:u32)->array<u32,8>{{
+ var v=array<u32,16>(cv[0],cv[1],cv[2],cv[3],cv[4],cv[5],cv[6],cv[7],0x6a09e667u,0xbb67ae85u,0x3c6ef372u,0xa54ff53au,0u,0u,blen,flags);
+ {rounds}
+ return array<u32,8>(v[0]^v[8],v[1]^v[9],v[2]^v[10],v[3]^v[11],v[4]^v[12],v[5]^v[13],v[6]^v[14],v[7]^v[15]);
+}}
+@compute @workgroup_size({WG_SIZE})
+fn solve(@builtin(global_invocation_id) gid:vec3<u32>){{
+ let first=gid.x*{STEPS}u;
+ for(var step=0u;step<{STEPS}u;step=step+1u){{
+  if((step&{}u)==0u&&atomicLoad(&R.flag)!=0u){{return;}}
+  let idx=first+step;if(idx>=P[2]){{return;}}let candidate=P[1]+idx;
+  let cv=array<u32,8>(P[8],P[9],P[10],P[11],P[12],P[13],P[14],P[15]);
+  var m:array<u32,16>;var nlo=candidate;var nhi=0u;var h:array<u32,8>;
+  if(P[0]==0u){{
+   m=array<u32,16>(P[16],P[17],P[18],P[19],P[20],P[21],P[22],P[23],P[24],P[25],P[26],P[27],P[28],P[29],P[30],P[31]);
+   var x=candidate;for(var j=0u;j<9u;j=j+1u){{let digit=x%10u;x=x/10u;let pos=P[32]+8u-j;let wi=pos>>2u;let sh=(pos&3u)*8u;m[wi]=(m[wi]&~(0xffu<<sh))|((0x30u+digit)<<sh);}}
+   h=compress(cv,m,P[33],P[34]);nlo=P[35]+candidate;let carry=select(0u,1u,nlo<P[35]);nhi=P[36]+carry;
+  }}else{{
+   m=array<u32,16>(P[16],candidate,0u,0u,0u,0u,0u,0u,0u,0u,0u,0u,0u,0u,0u,0u);h=compress(cv,m,8u,10u);nhi=P[16];
+  }}
+  if((h[0]&P[3])==0u&&(h[1]&P[4])==0u){{if(atomicExchange(&R.flag,1u)==0u){{R.nonce_lo=nlo;R.nonce_hi=nhi;for(var i=0u;i<8u;i=i+1u){{R.hash[i]=h[i];}}}}}}
+ }}
+}}
+"#,
+        CANCEL_INTERVAL - 1
+    )
 }
 
 fn multi_layout_shader_source() -> String {
