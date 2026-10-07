@@ -132,27 +132,27 @@ impl SingleBlockSolver {
                     }
 
                     let mut inner_key = if NO_TRAILING_ZEROS { 1 } else { 0 };
-                    let mut bumper = 1;
+                    if NO_TRAILING_ZEROS {
+                        let message_bytes = decompose_blocks_mut(&mut this.message.message);
+                        let logical = this.message.digit_index + 8;
+                        message_bytes[SWAP_DWORD_BYTE_ORDER[logical]] = b'1';
+                    }
                     let base_state = core::array::from_fn(|i| u32x4_splat(hotstart_state[i]));
-                    while inner_key < 10_000_000 {
-                        {
-                            let message_bytes = decompose_blocks_mut(&mut this.message.message);
-                            let mut key_copy = inner_key;
-                            for i in (0..7).rev() {
-                                let output = key_copy % 10;
-                                key_copy /= 10;
-                                *message_bytes.get_unchecked_mut(
-                                    *SWAP_DWORD_BYTE_ORDER
-                                        .get_unchecked(this.message.digit_index + i + 2),
-                                ) = output as u8 + b'0';
-                            }
 
-                            if key_copy != 0 {
-                                debug_assert_eq!(key_copy, 0);
-                                core::hint::unreachable_unchecked();
+                    #[inline(always)]
+                    fn increment_suffix(message: &mut [u32; 16], digit_index: usize) {
+                        let bytes = decompose_blocks_mut(message);
+                        for i in (0..7).rev() {
+                            let physical = SWAP_DWORD_BYTE_ORDER[digit_index + i + 2];
+                            if bytes[physical] != b'9' {
+                                bytes[physical] += 1;
+                                return;
                             }
+                            bytes[physical] = b'0';
                         }
+                    }
 
+                    while inner_key < 10_000_000 {
                         let mut blocks =
                             core::array::from_fn(|i| u32x4_splat(this.message.message[i]));
                         blocks[LANE_ID_0_WORD_IDX] =
@@ -226,13 +226,17 @@ impl SingleBlockSolver {
                         }
 
                         inner_key += 1;
+                        increment_suffix(&mut this.message.message, this.message.digit_index);
 
                         if NO_TRAILING_ZEROS {
-                            bumper += 1;
-                            let should_bump = bumper == 10;
-                            inner_key += should_bump as u32;
-                            if should_bump {
-                                bumper -= 9;
+                            let bytes = decompose_blocks_mut(&mut this.message.message);
+                            let logical = this.message.digit_index + 8;
+                            if bytes[SWAP_DWORD_BYTE_ORDER[logical]] == b'0' {
+                                inner_key += 1;
+                                increment_suffix(
+                                    &mut this.message.message,
+                                    this.message.digit_index,
+                                );
                             }
                         }
 
@@ -358,28 +362,20 @@ impl crate::solver::Solver for DoubleBlockSolver {
                     v128_or(lane_id_0_or_value, lane_id_1_or_value),
                 );
 
+                #[inline(always)]
+                fn increment_suffix(message: &mut [u32; 16]) {
+                    let bytes = decompose_blocks_mut(message);
+                    for logical in ((DoubleBlockMessage::DIGIT_IDX as usize + 2)..63).rev() {
+                        let physical = SWAP_DWORD_BYTE_ORDER[logical];
+                        if bytes[physical] != b'9' {
+                            bytes[physical] += 1;
+                            return;
+                        }
+                        bytes[physical] = b'0';
+                    }
+                }
+
                 for inner_key in 0..10_000_000 {
-                    let mut key_copy = inner_key;
-                    let mut cum0 = 0;
-                    for _ in 0..4 {
-                        cum0 <<= 8;
-                        cum0 |= key_copy % 10;
-                        key_copy /= 10;
-                    }
-                    cum0 |= u32::from_be_bytes(*b"0000");
-                    let mut cum1 = 0;
-                    for _ in 0..3 {
-                        cum1 += key_copy % 10;
-                        cum1 <<= 8;
-                        key_copy /= 10;
-                    }
-                    cum1 |= u32::from_be_bytes(*b"000\x80");
-
-                    if key_copy != 0 {
-                        debug_assert_eq!(key_copy, 0);
-                        core::hint::unreachable_unchecked();
-                    }
-
                     let mut blocks = [
                         u32x4_splat(self.message.message[0] as _),
                         u32x4_splat(self.message.message[1] as _),
@@ -395,8 +391,8 @@ impl crate::solver::Solver for DoubleBlockSolver {
                         u32x4_splat(self.message.message[11] as _),
                         u32x4_splat(self.message.message[12] as _),
                         lane_index_value_v,
-                        u32x4_splat(cum0 as _),
-                        u32x4_splat(cum1 as _),
+                        u32x4_splat(self.message.message[14] as _),
+                        u32x4_splat(self.message.message[15] as _),
                     ];
 
                     let mut state = core::array::from_fn(|i| u32x4_splat(partial_state[i]));
@@ -449,8 +445,6 @@ impl crate::solver::Solver for DoubleBlockSolver {
                             .unwrap();
                         let nonce_prefix = 10 + 4 * prefix_set_index + success_lane_idx;
 
-                        self.message.message[14] = cum0;
-                        self.message.message[15] = cum1;
                         // stamp the lane ID back onto the message
                         {
                             let message_bytes = decompose_blocks_mut(&mut self.message.message);
@@ -479,23 +473,15 @@ impl crate::solver::Solver for DoubleBlockSolver {
                             &terminal_message_without_constants,
                         );
 
-                        // reverse the byte order
-                        let mut nonce_suffix = 0;
-                        let mut key_copy = inner_key;
-                        for _ in 0..7 {
-                            nonce_suffix *= 10;
-                            nonce_suffix += key_copy % 10;
-                            key_copy /= 10;
-                        }
-
                         let computed_nonce = nonce_prefix as u64 * 10u64.pow(7)
-                            + nonce_suffix as u64
+                            + inner_key as u64
                             + self.message.nonce_addend;
 
                         // the nonce is the 8 digits in the message, plus the first two digits recomputed from the lane index
                         return Some((computed_nonce, *final_sha_state));
                     }
 
+                    increment_suffix(&mut self.message.message);
                     self.attempted_nonces += 4;
 
                     if self.attempted_nonces >= self.limit {

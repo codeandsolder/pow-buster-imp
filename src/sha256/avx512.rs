@@ -1,127 +1,34 @@
-//! Multi-way sha256 implementation extracted from `sha2` crate for AVX-512.
+//! Multi-way SHA-256 wrapper using the shared Portable-SIMD core.
 use core::arch::x86_64::*;
+use core::simd::u32x16;
 
-use super::*;
+use super::portable;
 
-#[macro_use]
-#[path = "loop_macros.rs"]
-mod loop_macros;
-
-/// Do a 16-way SHA-256 compression function without adding back the saved state, without feedback
-///
-/// This is useful for making state share registers with a-h when caller has the previous state recalled cheaply from elsewhere after the fact
 #[cfg_attr(not(debug_assertions), inline(always))]
 pub(crate) fn multiway_arx<const BEGIN_ROUND: usize>(
     state: &mut [__m512i; 8],
     block: &mut [__m512i; 16],
 ) {
-    unsafe {
-        let [a, b, c, d, e, f, g, h] = &mut *state;
-
-        repeat64!(i, {
-            if i >= BEGIN_ROUND {
-                let w = if i < 16 {
-                    block[i]
-                } else {
-                    let w15 = block[(i - 15) % 16];
-                    let s0 = _mm512_xor_si512(
-                        _mm512_xor_si512(_mm512_ror_epi32(w15, 7), _mm512_ror_epi32(w15, 18)),
-                        _mm512_srli_epi32(w15, 3),
-                    );
-                    let w2 = block[(i - 2) % 16];
-                    let s1 = _mm512_xor_si512(
-                        _mm512_xor_si512(_mm512_ror_epi32(w2, 17), _mm512_ror_epi32(w2, 19)),
-                        _mm512_srli_epi32(w2, 10),
-                    );
-                    block[i % 16] = _mm512_add_epi32(block[i % 16], s0);
-                    block[i % 16] = _mm512_add_epi32(block[i % 16], block[(i - 7) % 16]);
-                    block[i % 16] = _mm512_add_epi32(block[i % 16], s1);
-                    block[i % 16]
-                };
-
-                let s1 = _mm512_xor_si512(
-                    _mm512_xor_si512(_mm512_ror_epi32(*e, 6), _mm512_ror_epi32(*e, 11)),
-                    _mm512_ror_epi32(*e, 25),
-                );
-                let ch = _mm512_xor_si512(_mm512_and_si512(*e, *f), _mm512_andnot_si512(*e, *g));
-                let mut t1 = s1;
-                t1 = _mm512_add_epi32(t1, ch);
-                t1 = _mm512_add_epi32(t1, _mm512_set1_epi32(K32[i] as _));
-                t1 = _mm512_add_epi32(t1, w);
-                t1 = _mm512_add_epi32(t1, *h);
-
-                let s0 = _mm512_xor_si512(
-                    _mm512_xor_si512(_mm512_ror_epi32(*a, 2), _mm512_ror_epi32(*a, 13)),
-                    _mm512_ror_epi32(*a, 22),
-                );
-                let maj = _mm512_xor_si512(
-                    _mm512_xor_si512(_mm512_and_si512(*a, *b), _mm512_and_si512(*a, *c)),
-                    _mm512_and_si512(*b, *c),
-                );
-                let mut t2 = s0;
-                t2 = _mm512_add_epi32(t2, maj);
-
-                *h = *g;
-                *g = *f;
-                *f = *e;
-                *e = _mm512_add_epi32(*d, t1);
-                *d = *c;
-                *c = *b;
-                *b = *a;
-                *a = _mm512_add_epi32(t1, t2);
-            }
-        });
+    let mut state_simd: [u32x16; 8] = core::array::from_fn(|i| state[i].into());
+    let mut block_simd: [u32x16; 16] = core::array::from_fn(|i| block[i].into());
+    portable::multiway_arx::<16, BEGIN_ROUND>(&mut state_simd, &mut block_simd);
+    for i in 0..8 {
+        state[i] = state_simd[i].into();
+    }
+    for i in 0..16 {
+        block[i] = block_simd[i].into();
     }
 }
 
-/// Do a 16-way SHA-256 compression function using broadcasted message schedule, without feedback
-///
-/// You can skip loading the first couple words by passing a non-zero value for `LeadingZeroes`
 #[cfg_attr(not(debug_assertions), inline(always))]
-pub(crate) fn bcst_multiway_arx<const LEAD_ZEROES: usize>(
+pub(crate) fn bcst_multiway_arx<const LEADING_ZEROES: usize>(
     state: &mut [__m512i; 8],
     w_k: &[u32; 64],
 ) {
-    unsafe {
-        let [a, b, c, d, e, f, g, h] = &mut *state;
-
-        repeat64!(i, {
-            let w = if i < LEAD_ZEROES {
-                _mm512_set1_epi32(K32[i] as _)
-            } else {
-                _mm512_set1_epi32(w_k[i] as _)
-            };
-
-            let s1 = _mm512_xor_si512(
-                _mm512_xor_si512(_mm512_ror_epi32(*e, 6), _mm512_ror_epi32(*e, 11)),
-                _mm512_ror_epi32(*e, 25),
-            );
-            let ch = _mm512_xor_si512(_mm512_and_si512(*e, *f), _mm512_andnot_si512(*e, *g));
-            let mut t1 = s1;
-            t1 = _mm512_add_epi32(t1, ch);
-            t1 = _mm512_add_epi32(t1, w);
-            t1 = _mm512_add_epi32(t1, *h);
-
-            let s0 = _mm512_xor_si512(
-                _mm512_xor_si512(_mm512_ror_epi32(*a, 2), _mm512_ror_epi32(*a, 13)),
-                _mm512_ror_epi32(*a, 22),
-            );
-            let maj = _mm512_xor_si512(
-                _mm512_xor_si512(_mm512_and_si512(*a, *b), _mm512_and_si512(*a, *c)),
-                _mm512_and_si512(*b, *c),
-            );
-            let mut t2 = s0;
-            t2 = _mm512_add_epi32(t2, maj);
-
-            *h = *g;
-            *g = *f;
-            *f = *e;
-            *e = _mm512_add_epi32(*d, t1);
-            *d = *c;
-            *c = *b;
-            *b = *a;
-            *a = _mm512_add_epi32(t1, t2);
-        });
+    let mut state_simd: [u32x16; 8] = core::array::from_fn(|i| state[i].into());
+    portable::bcst_multiway_arx::<16, LEADING_ZEROES>(&mut state_simd, w_k);
+    for i in 0..8 {
+        state[i] = state_simd[i].into();
     }
 }
 
@@ -131,6 +38,7 @@ mod tests {
     use rand::{Rng, SeedableRng};
 
     use super::*;
+    use crate::sha256::{IV, digest_block, do_message_schedule_k_w};
 
     #[test]
     fn test_digest_block_equivalence() {

@@ -1,30 +1,8 @@
-use super::*;
+//! Multi-way BLAKE3 wrapper using the shared Portable-SIMD core.
 use core::arch::wasm32::*;
+use core::simd::u32x4;
 
-#[macro_use]
-#[path = "loop_macros.rs"]
-mod loop_macros;
-
-#[inline(always)]
-fn u32x4_ror(x: v128, shift: u32) -> v128 {
-    v128_or(u32x4_shr(x, shift), u32x4_shl(x, 32 - shift))
-}
-
-#[inline(always)]
-fn g4(va: &mut v128, vb: &mut v128, vc: &mut v128, vd: &mut v128, x: v128, y: v128) {
-    *va = u32x4_add(*va, u32x4_add(*vb, x));
-    *vd = v128_xor(*vd, *va);
-    *vd = u32x4_ror(*vd, 16);
-    *vc = u32x4_add(*vc, *vd);
-    *vb = v128_xor(*vb, *vc);
-    *vb = u32x4_ror(*vb, 12);
-    *va = u32x4_add(*va, u32x4_add(*vb, y));
-    *vd = v128_xor(*vd, *va);
-    *vd = u32x4_ror(*vd, 8);
-    *vc = u32x4_add(*vc, *vd);
-    *vb = v128_xor(*vb, *vc);
-    *vb = u32x4_ror(*vb, 7);
-}
+use super::portable;
 
 #[inline(always)]
 pub(crate) fn compress_mb4<const CONSTANT_WORD_COUNT: usize, const PATCH_1: usize>(
@@ -32,107 +10,26 @@ pub(crate) fn compress_mb4<const CONSTANT_WORD_COUNT: usize, const PATCH_1: usiz
     block_template: &[u32; 16],
     patch_1: v128,
 ) {
-    /*
-
-    FUNCTION BLAKE3_COMPRESS( h[0..7], m[0..15], t, len, flags )
-           FUNCTION BLAKE3_COMPRESS( h[0..7], m[0..15], t, len, flags )
-       |
-       |   // Initialize local 16-word array v[0..15]
-       |   v[0..7] := h[0..7]              // 8 words from the state.
-       |   v[8..11] := IV[0..3]            // 4 words from the IV.
-       |
-       |   v[12] :=  t[0]                  // Low word of the counter.
-       |   v[13] :=  t[1]                  // High word of the counter.
-       |   v[14] :=  len                   // Application data length.
-       |   v[15] :=  flags                 // Flags.
-       |
-       |   // Cryptographic mixing
-       |   FOR i = 0 TO 6 DO               // 7 rounds.
-       |   |
-       |   |   v := G( v, 0, 4,  8, 12, m[ 0], m[ 1] )
-       |   |   v := G( v, 1, 5,  9, 13, m[ 2], m[ 3] )
-       |   |   v := G( v, 2, 6, 10, 14, m[ 4], m[ 5] )
-       |   |   v := G( v, 3, 7, 11, 15, m[ 6], m[ 7] )
-       |   |
-       |   |   v := G( v, 0, 5, 10, 15, m[ 8], m[ 9] )
-       |   |   v := G( v, 1, 6, 11, 12, m[10], m[11] )
-       |   |   v := G( v, 2, 7,  8, 13, m[12], m[13] )
-       |   |   v := G( v, 3, 4,  9, 14, m[14], m[15] )
-       |   |
-       |   |   PERMUTE(m)                  // Apply the permutation.
-       |   |
-       |   END FOR
-       |
-       |   // Compute the output state (untruncated)
-       |   FOR i = 0 TO 7 DO
-       |   |   v[i] := v[i] ^ v[i + 8]
-       |   |   v[i + 8] := v[i + 8] ^ h[i]
-       |   END FOR.
-       |
-       |   RETURN v
-       |
-       END FUNCTION.
-
-    |
-    END FUNCTION. */
-    unsafe {
-        repeat7!(i, {
-            macro_rules! g4 {
-                ($f:ident; $a:literal, $b:literal, $c:literal, $d:literal, $x:literal, $y:literal) => {{
-                    let [va, vb, vc, vd] = v.get_disjoint_unchecked_mut([$a, $b, $c, $d]);
-                    let ix = MESSAGE_SCHEDULE[i][$x];
-                    let iy = MESSAGE_SCHEDULE[i][$y];
-                    $f(
-                        va,
-                        vb,
-                        vc,
-                        vd,
-                        if ix == PATCH_1 {
-                            patch_1
-                        } else {
-                            u32x4_splat(block_template[ix])
-                        },
-                        if iy == PATCH_1 {
-                            patch_1
-                        } else {
-                            u32x4_splat(block_template[iy])
-                        },
-                    );
-                }};
-                ($a:literal, $b:literal, $c:literal, $d:literal, $x:literal, $y:literal) => {{
-                    g4!(g4; $a, $b, $c, $d, $x, $y);
-                }};
-            }
-            if i > 0 || CONSTANT_WORD_COUNT < 2 {
-                g4!(0, 4, 8, 12, 0, 1);
-            }
-            if i > 0 || CONSTANT_WORD_COUNT < 4 {
-                g4!(1, 5, 9, 13, 2, 3);
-            }
-            if i > 0 || CONSTANT_WORD_COUNT < 6 {
-                g4!(2, 6, 10, 14, 4, 5);
-            }
-            if i > 0 || CONSTANT_WORD_COUNT < 8 {
-                g4!(3, 7, 11, 15, 6, 7);
-            }
-            if i > 0 || CONSTANT_WORD_COUNT < 10 {
-                g4!(0, 5, 10, 15, 8, 9);
-            }
-            if i > 0 || CONSTANT_WORD_COUNT < 12 {
-                g4!(1, 6, 11, 12, 10, 11);
-            }
-            if i > 0 || CONSTANT_WORD_COUNT < 14 {
-                g4!(2, 7, 8, 13, 12, 13);
-            }
-            if i > 0 || CONSTANT_WORD_COUNT < 16 {
-                g4!(3, 4, 9, 14, 14, 15);
-            }
-        });
-
-        repeat8!(i, {
-            v[i] = v128_xor(v[i], v[i + 8]);
-        });
+    let mut state: [u32x4; 16] = core::array::from_fn(|i| v[i].into());
+    let patch: u32x4 = patch_1.into();
+    portable::compress::<4, CONSTANT_WORD_COUNT, PATCH_1>(&mut state, block_template, patch);
+    for i in 0..16 {
+        v[i] = state[i].into();
     }
+}
+
+#[cfg(test)]
+#[inline(always)]
+fn g4(a: &mut v128, b: &mut v128, c: &mut v128, d: &mut v128, x: v128, y: v128) {
+    let mut aa: u32x4 = (*a).into();
+    let mut bb: u32x4 = (*b).into();
+    let mut cc: u32x4 = (*c).into();
+    let mut dd: u32x4 = (*d).into();
+    portable::g(&mut aa, &mut bb, &mut cc, &mut dd, x.into(), y.into());
+    *a = aa.into();
+    *b = bb.into();
+    *c = cc.into();
+    *d = dd.into();
 }
 
 #[cfg(test)]
@@ -140,6 +37,7 @@ mod tests {
     use blake3::Hasher;
 
     use super::*;
+    use crate::blake3::g;
 
     #[test]
     fn test_g_function() {

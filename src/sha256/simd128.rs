@@ -1,121 +1,48 @@
-//! Multi-way sha256 implementation extracted from `sha2` crate for simd128.
-use super::*;
+//! Multi-way SHA-256 wrapper using the shared Portable-SIMD core.
 use core::arch::wasm32::*;
+use core::simd::u32x4;
 
-#[macro_use]
-#[path = "loop_macros.rs"]
-mod loop_macros;
+use super::portable;
 
 #[inline(always)]
-fn u32x4_ror(x: v128, shift: u32) -> v128 {
-    v128_or(u32x4_shr(x, shift), u32x4_shl(x, 32 - shift))
-}
-
 pub(crate) fn multiway_arx<const BEGIN_ROUND: usize>(
     state: &mut [v128; 8],
     block: &mut [v128; 16],
 ) {
-    let [a, b, c, d, e, f, g, h] = &mut *state;
-
-    repeat64!(i, {
-        if i >= BEGIN_ROUND {
-            let w = if i < 16 {
-                block[i]
-            } else {
-                let w15 = block[(i - 15) % 16];
-                let s0 = v128_xor(
-                    v128_xor(u32x4_ror(w15, 7), u32x4_ror(w15, 18)),
-                    u32x4_shr(w15, 3),
-                );
-                let w2 = block[(i - 2) % 16];
-                let s1 = v128_xor(
-                    v128_xor(u32x4_ror(w2, 17), u32x4_ror(w2, 19)),
-                    u32x4_shr(w2, 10),
-                );
-                block[i % 16] = u32x4_add(block[i % 16], s0);
-                block[i % 16] = u32x4_add(block[i % 16], block[(i - 7) % 16]);
-                block[i % 16] = u32x4_add(block[i % 16], s1);
-                block[i % 16]
-            };
-
-            let s1 = v128_xor(
-                v128_xor(u32x4_ror(*e, 6), u32x4_ror(*e, 11)),
-                u32x4_ror(*e, 25),
-            );
-            let ch = v128_xor(v128_and(*e, *f), v128_andnot(*g, *e));
-            let mut t1 = s1;
-            t1 = u32x4_add(t1, ch);
-            t1 = u32x4_add(t1, u32x4_splat(K32[i] as _));
-            t1 = u32x4_add(t1, w);
-            t1 = u32x4_add(t1, *h);
-
-            let s0 = v128_xor(
-                v128_xor(u32x4_ror(*a, 2), u32x4_ror(*a, 13)),
-                u32x4_ror(*a, 22),
-            );
-            let maj = v128_xor(
-                v128_xor(v128_and(*a, *b), v128_and(*a, *c)),
-                v128_and(*b, *c),
-            );
-            let mut t2 = s0;
-            t2 = u32x4_add(t2, maj);
-
-            *h = *g;
-            *g = *f;
-            *f = *e;
-            *e = u32x4_add(*d, t1);
-            *d = *c;
-            *c = *b;
-            *b = *a;
-            *a = u32x4_add(t1, t2);
-        }
-    });
+    let mut state_simd: [u32x4; 8] = core::array::from_fn(|i| state[i].into());
+    let mut block_simd: [u32x4; 16] = core::array::from_fn(|i| block[i].into());
+    portable::multiway_arx::<4, BEGIN_ROUND>(&mut state_simd, &mut block_simd);
+    for i in 0..8 {
+        state[i] = state_simd[i].into();
+    }
+    for i in 0..16 {
+        block[i] = block_simd[i].into();
+    }
 }
 
-pub(crate) fn bcst_multiway_arx<const LEAD_ZEROES: usize>(state: &mut [v128; 8], w_k: &[u32; 64]) {
-    let [a, b, c, d, e, f, g, h] = &mut *state;
+#[inline(always)]
+pub(crate) fn bcst_multiway_arx<const LEADING_ZEROES: usize>(
+    state: &mut [v128; 8],
+    w_k: &[u32; 64],
+) {
+    let mut state_simd: [u32x4; 8] = core::array::from_fn(|i| state[i].into());
+    portable::bcst_multiway_arx::<4, LEADING_ZEROES>(&mut state_simd, w_k);
+    for i in 0..8 {
+        state[i] = state_simd[i].into();
+    }
+}
 
-    repeat64!(i, {
-        let w = if i < LEAD_ZEROES {
-            u32x4_splat(K32[i] as _)
-        } else {
-            u32x4_splat(w_k[i] as _)
-        };
-        let s1 = v128_xor(
-            v128_xor(u32x4_ror(*e, 6), u32x4_ror(*e, 11)),
-            u32x4_ror(*e, 25),
-        );
-        let ch = v128_xor(v128_and(*e, *f), v128_andnot(*g, *e));
-        let mut t1 = s1;
-        t1 = u32x4_add(t1, ch);
-        t1 = u32x4_add(t1, w);
-        t1 = u32x4_add(t1, *h);
-
-        let s0 = v128_xor(
-            v128_xor(u32x4_ror(*a, 2), u32x4_ror(*a, 13)),
-            u32x4_ror(*a, 22),
-        );
-        let maj = v128_xor(
-            v128_xor(v128_and(*a, *b), v128_and(*a, *c)),
-            v128_and(*b, *c),
-        );
-        let mut t2 = s0;
-        t2 = u32x4_add(t2, maj);
-
-        *h = *g;
-        *g = *f;
-        *f = *e;
-        *e = u32x4_add(*d, t1);
-        *d = *c;
-        *c = *b;
-        *b = *a;
-        *a = u32x4_add(t1, t2);
-    });
+#[cfg(test)]
+#[inline(always)]
+fn u32x4_ror(x: v128, shift: u32) -> v128 {
+    let v: u32x4 = x.into();
+    ((v >> shift) | (v << (32 - shift))).into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sha256::IV;
 
     #[test]
     fn test_simd128_ror() {
