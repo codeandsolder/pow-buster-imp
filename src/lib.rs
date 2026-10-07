@@ -453,7 +453,12 @@ pub const fn compute_target_mcaptcha(difficulty_factor: u64) -> u64 {
 
 /// Compute the mask for an Anubis PoW (mask & (V\[0] << 32 | V\[1]) == 0)
 pub const fn compute_mask_anubis(difficulty_factor: NonZeroU8) -> u64 {
-    !(!0u64 >> (difficulty_factor.get() * 4))
+    let bits = difficulty_factor.get().saturating_mul(4);
+    if bits >= 64 {
+        u64::MAX
+    } else {
+        !(!0u64 >> bits)
+    }
 }
 
 /// Compute the mask for a GoAway PoW (mask & (V\[0] << 32) == 0)
@@ -566,6 +571,7 @@ mod tests {
             compute_mask_anubis(NonZeroU8::new(3).unwrap()),
             0xfffu64.reverse_bits(),
         );
+        assert_eq!(compute_mask_anubis(NonZeroU8::new(16).unwrap()), u64::MAX,);
     }
 
     #[test]
