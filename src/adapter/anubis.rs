@@ -153,4 +153,9 @@ impl AnubisRules {
     pub fn algorithm(&self) -> &str {
         &self.algorithm
     }
+
+    /// Difficulty in leading zero nibbles.
+    pub fn difficulty(&self) -> u8 {
+        self.difficulty
+    }
 }

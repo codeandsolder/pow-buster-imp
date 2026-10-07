@@ -20,8 +20,15 @@ pub mod client;
 /// Server for end-to-end PoW solving
 pub mod server;
 
+#[cfg(feature = "gpu")]
+/// GPU solver backend using native `wgpu` or browser WebGPU.
+pub mod gpu;
+
 #[cfg(all(target_arch = "wasm32", feature = "adapter"))]
 mod wasm_ffi;
+
+#[cfg(all(target_arch = "wasm32", feature = "gpu"))]
+mod gpu_wasm_ffi;
 
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 cfg_if::cfg_if! {

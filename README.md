@@ -78,6 +78,7 @@ Optional Features:
 - `live-throughput-test`: End-to-end multi-worker throughput benchmark.
 - `server`: Solver-as-a-Service API.
 - `server-wasm`: Solver-as-a-Service API (with WASM simd128 solver, build first with `./build_wasm.sh`).
+- `gpu`: Async GPU solver backend using `wgpu`. Native builds use Vulkan/Metal/DX12 as available; `wasm32-unknown-unknown` uses browser WebGPU.
 - `tracing`: Write tracing for debugging.
 - `tracing-subscriber`: For binary releases only, writes tracing logs to console.
 
@@ -151,6 +152,25 @@ This isn't a vulnerability nor anything previously unknown, it's a structural we
 This is a structural limitation, PoW is supposed for global consensus, not maintaining a meaningful peer-to-peer "fair" hash rate margin, especially not when compared to commodity hardware. Every academic paper will tell you that PoW system loses protection margin using hardware or software optimizations. I implemented it, that's it.
 
 Website operators deploying a PoW system bear the responsibility to understand the performance characteristics and security implications of their chosen PoW parameters, and whether that protects against their identified threat. **The purpose of this research is to provide the statistical analysis and empirical validation data necessary for informed deployment decisions, including optimized CPU only solutions.**
+
+## GPU solver backend
+
+The optional `gpu` feature exposes the same Rust GPU backend on native and `wasm32` targets. Its SHA-256 solver surface mirrors the CPU backend (`SingleBlockSolver`, `DoubleBlockSolver`, `DecimalSolver`, `BinarySolver`, and `GoAwaySolver`) and shares one reusable `GpuContext`. Compatible single-block layouts automatically select the optimized Gray-order kernel; other message layouts use generic correctness paths.
+
+```rust,ignore
+use core::num::NonZeroU8;
+use pow_buster::gpu::AnubisGpuSolver;
+
+let mut solver = AnubisGpuSolver::create().await?;
+let solution = solver
+    .solve(challenge.as_bytes(), NonZeroU8::new(6).unwrap())
+    .await?;
+println!("{}", solution.nonce);
+```
+
+The Anubis convenience API shown above remains available. For a normal block-aligned Anubis challenge (including the usual 128-byte random data), it selects a reduced-radix Gray-order fast path. Arbitrary single/double-block decimal layouts, binary SHA-256 nonces, and GoAway messages are supported through the protocol-agnostic GPU solver types. Every winning proof is independently recomputed on the CPU before it is returned.
+
+For browser use, build with `--target wasm32-unknown-unknown --features gpu`. The wasm-bindgen build exports `createAnubisGpuSolver()`, which returns an object with async `solve(prefix, difficulty)` and `warmUp()` methods backed by browser WebGPU. Calling `warmUp()` during extension/application startup moves lazy browser/driver pipeline setup out of the first real challenge. The SHA-256 hot loop executes in WGSL on the GPU; WASM only performs setup, dispatch and result handling.
 
 ## Benchmark
 
