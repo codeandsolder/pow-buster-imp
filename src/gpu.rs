@@ -14,6 +14,11 @@ const HASHES_PER_WG: u64 = WG_SIZE as u64 * STEPS as u64;
 const CANCEL_INTERVAL: u32 = 16;
 const COUNTER_SPACE: u64 = 1_u64 << 54;
 
+#[inline]
+fn gpu_batch_target(expected_work: u64, quantum: u64) -> u64 {
+    expected_work.saturating_mul(3).div_ceil(10).max(quantum)
+}
+
 /// Error returned by the GPU solver.
 #[derive(Debug, Clone)]
 pub struct GpuError(String);
@@ -60,7 +65,9 @@ pub struct GpuContext {
     pipeline: wgpu::ComputePipeline,
     in_buf: wgpu::Buffer,
     generic_pipeline: wgpu::ComputePipeline,
-    multi_pipeline: wgpu::ComputePipeline,
+    double_pipeline: wgpu::ComputePipeline,
+    goaway_pipeline: wgpu::ComputePipeline,
+    binary_pipeline: wgpu::ComputePipeline,
     cerberus_pipeline: wgpu::ComputePipeline,
     altcha_pipeline: wgpu::ComputePipeline,
     generic_in_buf: wgpu::Buffer,
@@ -68,7 +75,9 @@ pub struct GpuContext {
     staging: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     generic_bind_group: wgpu::BindGroup,
-    multi_bind_group: wgpu::BindGroup,
+    double_bind_group: wgpu::BindGroup,
+    goaway_bind_group: wgpu::BindGroup,
+    binary_bind_group: wgpu::BindGroup,
     cerberus_bind_group: wgpu::BindGroup,
     altcha_bind_group: wgpu::BindGroup,
     max_wgs: u32,
@@ -126,14 +135,23 @@ impl GpuContext {
             label: Some("pow-buster-sha256-multi-layout"),
             source: wgpu::ShaderSource::Wgsl(Cow::Owned(multi_layout_shader_source())),
         });
-        let multi_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("pow-buster-sha256-multi-layout"),
-            layout: None,
-            module: &multi_shader,
-            entry_point: Some("solve"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let create_multi_pipeline = |label, mode| {
+            let constants = [("MODE", mode)];
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: None,
+                module: &multi_shader,
+                entry_point: Some("solve"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &constants,
+                    ..Default::default()
+                },
+                cache: None,
+            })
+        };
+        let double_pipeline = create_multi_pipeline("pow-buster-sha256-double-block", 1.0);
+        let goaway_pipeline = create_multi_pipeline("pow-buster-sha256-goaway", 2.0);
+        let binary_pipeline = create_multi_pipeline("pow-buster-sha256-binary", 3.0);
         let cerberus_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("pow-buster-cerberus"),
             source: wgpu::ShaderSource::Wgsl(Cow::Owned(cerberus_shader_source())),
@@ -212,20 +230,26 @@ impl GpuContext {
                 },
             ],
         });
-        let multi_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("pow-buster-sha256-multi-layout"),
-            layout: &multi_pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: generic_in_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: out_buf.as_entire_binding(),
-                },
-            ],
-        });
+        let make_multi_bind_group = |label: &'static str, pipeline: &wgpu::ComputePipeline| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: generic_in_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: out_buf.as_entire_binding(),
+                    },
+                ],
+            })
+        };
+        let double_bind_group =
+            make_multi_bind_group("pow-buster-sha256-double-block", &double_pipeline);
+        let goaway_bind_group = make_multi_bind_group("pow-buster-sha256-goaway", &goaway_pipeline);
+        let binary_bind_group = make_multi_bind_group("pow-buster-sha256-binary", &binary_pipeline);
         let cerberus_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("pow-buster-cerberus"),
             layout: &cerberus_pipeline.get_bind_group_layout(0),
@@ -262,7 +286,9 @@ impl GpuContext {
             pipeline,
             in_buf,
             generic_pipeline,
-            multi_pipeline,
+            double_pipeline,
+            goaway_pipeline,
+            binary_pipeline,
             cerberus_pipeline,
             altcha_pipeline,
             generic_in_buf,
@@ -270,7 +296,9 @@ impl GpuContext {
             staging,
             bind_group,
             generic_bind_group,
-            multi_bind_group,
+            double_bind_group,
+            goaway_bind_group,
+            binary_bind_group,
             cerberus_bind_group,
             altcha_bind_group,
             max_wgs: limits.max_compute_workgroups_per_dimension,
@@ -313,9 +341,19 @@ impl GpuContext {
                 &self.generic_bind_group,
             ),
             (
-                "pow-buster-sha256-multi-layout-warmup",
-                &self.multi_pipeline,
-                &self.multi_bind_group,
+                "pow-buster-sha256-double-block-warmup",
+                &self.double_pipeline,
+                &self.double_bind_group,
+            ),
+            (
+                "pow-buster-sha256-goaway-warmup",
+                &self.goaway_pipeline,
+                &self.goaway_bind_group,
+            ),
+            (
+                "pow-buster-sha256-binary-warmup",
+                &self.binary_pipeline,
+                &self.binary_bind_group,
             ),
             (
                 "pow-buster-cerberus-warmup",
@@ -391,7 +429,7 @@ impl GpuContext {
         self.queue.write_buffer(&self.out_buf, 0, &[0; 48]);
 
         let expected = 16_u64.saturating_pow(u32::from(difficulty.get()));
-        let desired = expected.saturating_mul(8).max(HASHES_PER_WG);
+        let desired = gpu_batch_target(expected, HASHES_PER_WG);
         let limit = max_hashes.min(COUNTER_SPACE);
         let mut base = 0_u64;
 
@@ -512,9 +550,10 @@ impl GpuContext {
         };
         self.queue.write_buffer(&self.out_buf, 0, &[0; 48]);
 
-        let desired = expected_work::<{ crate::solver::SOLVE_TYPE_MASK }>(0, mask)
-            .saturating_mul(8)
-            .max(HASHES_PER_WG);
+        let desired = gpu_batch_target(
+            expected_work::<{ crate::solver::SOLVE_TYPE_MASK }>(0, mask),
+            HASHES_PER_WG,
+        );
         let limit = max_hashes.min(COUNTER_SPACE);
         let mut base = 0_u64;
 
@@ -602,9 +641,7 @@ impl GpuContext {
             | (u32::from(cfg!(feature = "compare-64bit")) << 1);
         self.queue.write_buffer(&self.out_buf, 0, &[0; 48]);
 
-        let desired = expected_work::<TYPE>(target, mask)
-            .saturating_mul(8)
-            .max(HASHES_PER_WG);
+        let desired = gpu_batch_target(expected_work::<TYPE>(target, mask), HASHES_PER_WG);
         let mut offset = 0_u64;
 
         while offset < limit {
@@ -667,18 +704,38 @@ impl GpuContext {
         self.queue.write_buffer(&self.out_buf, 0, &[0; 48]);
         self.queue
             .write_buffer(&self.generic_in_buf, 0, bytemuck::cast_slice(params));
+        let (label, pipeline, bind_group) = match params[0] {
+            1 => (
+                "pow-buster-sha256-double-block",
+                &self.double_pipeline,
+                &self.double_bind_group,
+            ),
+            2 => (
+                "pow-buster-sha256-goaway",
+                &self.goaway_pipeline,
+                &self.goaway_bind_group,
+            ),
+            3 => (
+                "pow-buster-sha256-binary",
+                &self.binary_pipeline,
+                &self.binary_bind_group,
+            ),
+            mode => {
+                return Err(GpuError::new(format!(
+                    "invalid SHA-256 GPU layout mode {mode}"
+                )));
+            }
+        };
         let mut encoder = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("pow-buster-sha256-multi-layout"),
-            });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("pow-buster-sha256-multi-layout"),
+                label: Some(label),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.multi_pipeline);
-            pass.set_bind_group(0, &self.multi_bind_group, &[]);
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, bind_group, &[]);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
         encoder.copy_buffer_to_buffer(&self.out_buf, 0, &self.staging, 0, 48);
@@ -899,9 +956,7 @@ impl DoubleBlockSolver {
         } else {
             0
         };
-        let desired = expected_work::<TYPE>(target, mask)
-            .saturating_mul(8)
-            .max(HASHES_PER_WG);
+        let desired = gpu_batch_target(expected_work::<TYPE>(target, mask), HASHES_PER_WG);
         let mut offset = 0_u64;
         while offset < limit {
             let batch = desired
@@ -920,6 +975,12 @@ impl DoubleBlockSolver {
             p[9] = mask as u32;
             p[16..24].copy_from_slice(&self.message.prefix_state.0);
             p[24..40].copy_from_slice(&self.message.message.0);
+            let mut hot_state = self.message.prefix_state.0;
+            crate::sha256::ingest_message_prefix::<13>(
+                &mut hot_state,
+                self.message.message[..13].try_into().unwrap(),
+            );
+            p[44..52].copy_from_slice(&hot_state);
             p[40] = self.message.nonce_addend as u32;
             p[41] = (self.message.nonce_addend >> 32) as u32;
             let bitlen = self.message.message_length.saturating_mul(8);
@@ -1036,9 +1097,7 @@ impl GoAwaySolver {
         mask: u64,
     ) -> Result<Option<GpuSolution>, GpuError> {
         let limit = self.limit.min(u64::from(u32::MAX) + 1);
-        let desired = expected_work::<TYPE>(target, mask)
-            .saturating_mul(8)
-            .max(HASHES_PER_WG);
+        let desired = gpu_batch_target(expected_work::<TYPE>(target, mask), HASHES_PER_WG);
         let mut offset = 0_u64;
         while offset < limit {
             let batch = desired
@@ -1057,6 +1116,12 @@ impl GoAwaySolver {
             p[9] = mask as u32;
             p[16..24].copy_from_slice(&self.message.challenge);
             p[24] = self.message.high_word;
+            let mut hot_state = crate::sha256::IV;
+            let mut invariant = [0_u32; 9];
+            invariant[..8].copy_from_slice(&self.message.challenge);
+            invariant[8] = self.message.high_word;
+            crate::sha256::ingest_message_prefix::<9>(&mut hot_state, invariant);
+            p[40..48].copy_from_slice(&hot_state);
             if let Some((nonce, hash)) = gpu.dispatch_multi(&p, wgs).await? {
                 self.attempted_nonces = offset + batch;
                 if !verify_goaway::<TYPE>(&self.message, nonce, hash, target, mask) {
@@ -1122,9 +1187,7 @@ impl BinarySolver {
         let space = if bits == 64 { u64::MAX } else { 1_u64 << bits };
         let limit = self.limit.min(space);
         let (templates, used) = binary_templates(&self.message);
-        let desired = expected_work::<TYPE>(target, mask)
-            .saturating_mul(8)
-            .max(HASHES_PER_WG);
+        let desired = gpu_batch_target(expected_work::<TYPE>(target, mask), HASHES_PER_WG);
         let mut base = 0_u64;
         while base < limit {
             let batch = desired
@@ -1220,7 +1283,7 @@ impl CerberusSolver {
         }
         let _ = TYPE;
         let expected = 1_u64.checked_shl(mask.count_ones()).unwrap_or(u64::MAX);
-        let desired = expected.saturating_mul(8).max(HASHES_PER_WG);
+        let desired = gpu_batch_target(expected, HASHES_PER_WG);
         let search_space = match &self.message {
             crate::message::CerberusMessage::Decimal(_) => 1_000_000_000_u64,
             crate::message::CerberusMessage::Binary(_) => u64::from(u32::MAX),
@@ -1327,9 +1390,10 @@ impl AltchaSha256Solver {
         mask: u64,
     ) -> Result<Option<GpuSolution>, GpuError> {
         let limit = self.limit.min(u64::from(u32::MAX));
-        let desired = expected_work_full64::<TYPE>(target, mask)
-            .saturating_mul(4)
-            .max(u64::from(WG_SIZE));
+        let desired = gpu_batch_target(
+            expected_work_full64::<TYPE>(target, mask),
+            u64::from(WG_SIZE),
+        );
         let max_batch = u64::from(gpu.max_wgs) * u64::from(WG_SIZE);
         let mut base = 0_u64;
         while base < limit {
@@ -1663,24 +1727,26 @@ fn verify_altcha<const TYPE: u8>(
 }
 
 fn altcha_shader_source() -> String {
-    let constants = crate::sha256::K32
-        .iter()
-        .map(|k| format!("0x{k:08x}u"))
-        .collect::<Vec<_>>()
-        .join(",");
+    let mut rounds = String::new();
+    for (t, k) in crate::sha256::K32.iter().enumerate() {
+        let i = t & 15;
+        if t >= 16 {
+            rounds.push_str(&format!("w{i}=(rotr(w{},17u)^rotr(w{},19u)^(w{}>>10u))+w{}+(rotr(w{},7u)^rotr(w{},18u)^(w{}>>3u))+w{i};\n",(t-2)&15,(t-2)&15,(t-2)&15,(t-7)&15,(t-15)&15,(t-15)&15,(t-15)&15));
+        }
+        rounds.push_str(&format!("{{let t1=h+(rotr(e,6u)^rotr(e,11u)^rotr(e,25u))+(g^(e&(f^g)))+0x{k:08x}u+w{i};let t2=(rotr(a,2u)^rotr(a,13u)^rotr(a,22u))+((a&b)^(a&c)^(b&c));h=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=t1+t2;}}\n"));
+    }
     format!(
         r#"
-const K:array<u32,64>=array<u32,64>({constants});
 const IV:array<u32,8>=array<u32,8>(0x6a09e667u,0xbb67ae85u,0x3c6ef372u,0xa54ff53au,0x510e527fu,0x9b05688cu,0x1f83d9abu,0x5be0cd19u);
 struct OutBuf {{ flag:atomic<u32>,nonce_lo:u32,nonce_hi:u32,hash:array<u32,8> }};
 @group(0) @binding(0) var<storage,read> P:array<u32>;
 @group(0) @binding(1) var<storage,read_write> R:OutBuf;
 fn rotr(x:u32,n:u32)->u32{{return (x>>n)|(x<<(32u-n));}}
 fn compress(s:array<u32,8>,block:array<u32,16>)->array<u32,8>{{
- var w:array<u32,64>;for(var i=0u;i<16u;i=i+1u){{w[i]=block[i];}}
- for(var i=16u;i<64u;i=i+1u){{let s0=rotr(w[i-15u],7u)^rotr(w[i-15u],18u)^(w[i-15u]>>3u);let s1=rotr(w[i-2u],17u)^rotr(w[i-2u],19u)^(w[i-2u]>>10u);w[i]=w[i-16u]+s0+w[i-7u]+s1;}}
+ var w0=block[0];var w1=block[1];var w2=block[2];var w3=block[3];var w4=block[4];var w5=block[5];var w6=block[6];var w7=block[7];
+ var w8=block[8];var w9=block[9];var w10=block[10];var w11=block[11];var w12=block[12];var w13=block[13];var w14=block[14];var w15=block[15];
  var a=s[0];var b=s[1];var c=s[2];var d=s[3];var e=s[4];var f=s[5];var g=s[6];var h=s[7];
- for(var i=0u;i<64u;i=i+1u){{let t1=h+(rotr(e,6u)^rotr(e,11u)^rotr(e,25u))+(g^(e&(f^g)))+K[i]+w[i];let t2=(rotr(a,2u)^rotr(a,13u)^rotr(a,22u))+((a&b)^(a&c)^(b&c));h=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=t1+t2;}}
+ {rounds}
  return array<u32,8>(s[0]+a,s[1]+b,s[2]+c,s[3]+d,s[4]+e,s[5]+f,s[6]+g,s[7]+h);
 }}
 fn target_ok(h0:u32,h1:u32)->bool{{
@@ -1754,15 +1820,18 @@ fn compress(cv:array<u32,8>,m:array<u32,16>,blen:u32,flags:u32)->array<u32,8>{{
 @compute @workgroup_size({WG_SIZE})
 fn solve(@builtin(global_invocation_id) gid:vec3<u32>){{
  let first=gid.x*{STEPS}u;
+ var decimal_m=array<u32,16>(P[16],P[17],P[18],P[19],P[20],P[21],P[22],P[23],P[24],P[25],P[26],P[27],P[28],P[29],P[30],P[31]);
+ if(P[0]==0u&&first<P[2]){{
+  var x=P[1]+first;for(var j=0u;j<9u;j=j+1u){{let digit=x%10u;x=x/10u;let pos=P[32]+8u-j;let wi=pos>>2u;let sh=(pos&3u)*8u;decimal_m[wi]=(decimal_m[wi]&~(0xffu<<sh))|((0x30u+digit)<<sh);}}
+ }}
  for(var step=0u;step<{STEPS}u;step=step+1u){{
   if((step&{}u)==0u&&atomicLoad(&R.flag)!=0u){{return;}}
   let idx=first+step;if(idx>=P[2]){{return;}}let candidate=P[1]+idx;
   let cv=array<u32,8>(P[8],P[9],P[10],P[11],P[12],P[13],P[14],P[15]);
   var m:array<u32,16>;var nlo=candidate;var nhi=0u;var h:array<u32,8>;
   if(P[0]==0u){{
-   m=array<u32,16>(P[16],P[17],P[18],P[19],P[20],P[21],P[22],P[23],P[24],P[25],P[26],P[27],P[28],P[29],P[30],P[31]);
-   var x=candidate;for(var j=0u;j<9u;j=j+1u){{let digit=x%10u;x=x/10u;let pos=P[32]+8u-j;let wi=pos>>2u;let sh=(pos&3u)*8u;m[wi]=(m[wi]&~(0xffu<<sh))|((0x30u+digit)<<sh);}}
-   h=compress(cv,m,P[33],P[34]);nlo=P[35]+candidate;let carry=select(0u,1u,nlo<P[35]);nhi=P[36]+carry;
+   m=decimal_m;h=compress(cv,m,P[33],P[34]);nlo=P[35]+candidate;let carry=select(0u,1u,nlo<P[35]);nhi=P[36]+carry;
+   if(step+1u<{STEPS}u&&idx+1u<P[2]){{var j=0u;loop{{let pos=P[32]+8u-j;let wi=pos>>2u;let sh=(pos&3u)*8u;let digit=(decimal_m[wi]>>sh)&0xffu;if(digit<0x39u){{decimal_m[wi]=(decimal_m[wi]&~(0xffu<<sh))|((digit+1u)<<sh);break;}}decimal_m[wi]=(decimal_m[wi]&~(0xffu<<sh))|(0x30u<<sh);j=j+1u;if(j==9u){{break;}}}}}}
   }}else{{
    m=array<u32,16>(P[16],candidate,0u,0u,0u,0u,0u,0u,0u,0u,0u,0u,0u,0u,0u,0u);h=compress(cv,m,8u,10u);nhi=P[16];
   }}
@@ -1775,15 +1844,24 @@ fn solve(@builtin(global_invocation_id) gid:vec3<u32>){{
 }
 
 fn multi_layout_shader_source() -> String {
-    let constants = crate::sha256::K32
-        .iter()
-        .map(|k| format!("0x{k:08x}u"))
-        .collect::<Vec<_>>()
-        .join(",");
+    let build_rounds = |start: usize| {
+        let mut rounds = String::new();
+        for (t, k) in crate::sha256::K32.iter().enumerate().skip(start) {
+            let i = t & 15;
+            if t >= 16 {
+                rounds.push_str(&format!("w{i}=(rotr(w{},17u)^rotr(w{},19u)^(w{}>>10u))+w{}+(rotr(w{},7u)^rotr(w{},18u)^(w{}>>3u))+w{i};\n",(t-2)&15,(t-2)&15,(t-2)&15,(t-7)&15,(t-15)&15,(t-15)&15,(t-15)&15));
+            }
+            rounds.push_str(&format!("{{let t1=h+(rotr(e,6u)^rotr(e,11u)^rotr(e,25u))+(g^(e&(f^g)))+0x{k:08x}u+w{i};let t2=(rotr(a,2u)^rotr(a,13u)^rotr(a,22u))+((a&b)^(a&c)^(b&c));h=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=t1+t2;}}\n"));
+        }
+        rounds
+    };
+    let rounds = build_rounds(0);
+    let rounds9 = build_rounds(9);
+    let rounds13 = build_rounds(13);
     format!(
         r#"
-const K:array<u32,64>=array<u32,64>({constants});
 const IV:array<u32,8>=array<u32,8>(0x6a09e667u,0xbb67ae85u,0x3c6ef372u,0xa54ff53au,0x510e527fu,0x9b05688cu,0x1f83d9abu,0x5be0cd19u);
+override MODE:u32;
 struct OutBuf {{ flag:atomic<u32>,nonce_lo:u32,nonce_hi:u32,hash:array<u32,8> }};
 @group(0) @binding(0) var<storage,read> P:array<u32>;
 @group(0) @binding(1) var<storage,read_write> R:OutBuf;
@@ -1797,36 +1875,60 @@ fn target_ok(h0:u32,h1:u32)->bool{{
  let hi=(h0&P[8])==(P[6]&P[8]);return hi&&select(true,(h1&P[9])==(P[7]&P[9]),full);
 }}
 fn compress(s:array<u32,8>,block:array<u32,16>)->array<u32,8>{{
- var w:array<u32,64>;for(var i=0u;i<16u;i=i+1u){{w[i]=block[i];}}
- for(var i=16u;i<64u;i=i+1u){{let s0=rotr(w[i-15u],7u)^rotr(w[i-15u],18u)^(w[i-15u]>>3u);let s1=rotr(w[i-2u],17u)^rotr(w[i-2u],19u)^(w[i-2u]>>10u);w[i]=w[i-16u]+s0+w[i-7u]+s1;}}
+ var w0=block[0];var w1=block[1];var w2=block[2];var w3=block[3];var w4=block[4];var w5=block[5];var w6=block[6];var w7=block[7];
+ var w8=block[8];var w9=block[9];var w10=block[10];var w11=block[11];var w12=block[12];var w13=block[13];var w14=block[14];var w15=block[15];
  var a=s[0];var b=s[1];var c=s[2];var d=s[3];var e=s[4];var f=s[5];var g=s[6];var h=s[7];
- for(var i=0u;i<64u;i=i+1u){{let t1=h+(rotr(e,6u)^rotr(e,11u)^rotr(e,25u))+(g^(e&(f^g)))+K[i]+w[i];let t2=(rotr(a,2u)^rotr(a,13u)^rotr(a,22u))+((a&b)^(a&c)^(b&c));h=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=t1+t2;}}
+ {rounds}
  return array<u32,8>(s[0]+a,s[1]+b,s[2]+c,s[3]+d,s[4]+e,s[5]+f,s[6]+g,s[7]+h);
+}}
+fn compress9(feed:array<u32,8>,s:array<u32,8>,block:array<u32,16>)->array<u32,8>{{
+ var w0=block[0];var w1=block[1];var w2=block[2];var w3=block[3];var w4=block[4];var w5=block[5];var w6=block[6];var w7=block[7];
+ var w8=block[8];var w9=block[9];var w10=block[10];var w11=block[11];var w12=block[12];var w13=block[13];var w14=block[14];var w15=block[15];
+ var a=s[0];var b=s[1];var c=s[2];var d=s[3];var e=s[4];var f=s[5];var g=s[6];var h=s[7];
+ {rounds9}
+ return array<u32,8>(feed[0]+a,feed[1]+b,feed[2]+c,feed[3]+d,feed[4]+e,feed[5]+f,feed[6]+g,feed[7]+h);
+}}
+fn compress13(feed:array<u32,8>,s:array<u32,8>,block:array<u32,16>)->array<u32,8>{{
+ var w0=block[0];var w1=block[1];var w2=block[2];var w3=block[3];var w4=block[4];var w5=block[5];var w6=block[6];var w7=block[7];
+ var w8=block[8];var w9=block[9];var w10=block[10];var w11=block[11];var w12=block[12];var w13=block[13];var w14=block[14];var w15=block[15];
+ var a=s[0];var b=s[1];var c=s[2];var d=s[3];var e=s[4];var f=s[5];var g=s[6];var h=s[7];
+ {rounds13}
+ return array<u32,8>(feed[0]+a,feed[1]+b,feed[2]+c,feed[3]+d,feed[4]+e,feed[5]+f,feed[6]+g,feed[7]+h);
 }}
 fn publish(nlo:u32,nhi:u32,h:array<u32,8>){{if(target_ok(h[0],h[1])&&atomicExchange(&R.flag,1u)==0u){{R.nonce_lo=nlo;R.nonce_hi=nhi;for(var i=0u;i<8u;i=i+1u){{R.hash[i]=h[i];}}}}}}
 @compute @workgroup_size({WG_SIZE})
 fn solve(@builtin(global_invocation_id) gid:vec3<u32>){{
  let first=gid.x*{STEPS}u;
+ var decimal_block=array<u32,16>(P[24],P[25],P[26],P[27],P[28],P[29],P[30],P[31],P[32],P[33],P[34],P[35],P[36],P[37],P[38],P[39]);
+ var binary_blocks=array<u32,32>(P[24],P[25],P[26],P[27],P[28],P[29],P[30],P[31],P[32],P[33],P[34],P[35],P[36],P[37],P[38],P[39],P[40],P[41],P[42],P[43],P[44],P[45],P[46],P[47],P[48],P[49],P[50],P[51],P[52],P[53],P[54],P[55]);
+ if(MODE==1u&&first<P[5]){{
+  var x=P[3]+first;
+  for(var j=0u;j<9u;j=j+1u){{let digit=x%10u;x=x/10u;let pos=62u-j;let wi=pos>>2u;let sh=(3u-(pos&3u))*8u;decimal_block[wi]=(decimal_block[wi]&~(0xffu<<sh))|((0x30u+digit)<<sh);}}
+ }}
+ if(MODE==3u&&first<P[5]){{
+  let blo=P[3]+first;let bc=select(0u,1u,blo<P[3]);let bhi=P[4]+bc;
+  for(var j=0u;j<P[11];j=j+1u){{let byte=select((blo>>(j*8u))&0xffu,(bhi>>((j-4u)*8u))&0xffu,j>=4u);let pos=P[12]+j;let wi=pos>>2u;let sh=(3u-(pos&3u))*8u;binary_blocks[wi]=(binary_blocks[wi]&~(0xffu<<sh))|(byte<<sh);}}
+ }}
  for(var step=0u;step<{STEPS}u;step=step+1u){{
   if((step&{}u)==0u&&atomicLoad(&R.flag)!=0u){{return;}}
   let idx=first+step;if(idx>=P[5]){{return;}}
-  let clo=P[3]+idx;let carry=select(0u,1u,clo<P[3]);let chi=P[4]+carry;let mode=P[0];
+  let clo=P[3]+idx;let carry=select(0u,1u,clo<P[3]);let chi=P[4]+carry;let mode=MODE;
   if(mode==1u){{
-   var block=array<u32,16>(P[24],P[25],P[26],P[27],P[28],P[29],P[30],P[31],P[32],P[33],P[34],P[35],P[36],P[37],P[38],P[39]);
-   var x=clo;for(var j=0u;j<9u;j=j+1u){{let digit=x%10u;x=x/10u;let pos=62u-j;let wi=pos>>2u;let sh=(3u-(pos&3u))*8u;block[wi]=(block[wi]&~(0xffu<<sh))|((0x30u+digit)<<sh);}}
-   let st=array<u32,8>(P[16],P[17],P[18],P[19],P[20],P[21],P[22],P[23]);let mid=compress(st,block);
+   let st=array<u32,8>(P[16],P[17],P[18],P[19],P[20],P[21],P[22],P[23]);let hs=array<u32,8>(P[44],P[45],P[46],P[47],P[48],P[49],P[50],P[51]);let mid=compress13(st,hs,decimal_block);
    var tail=array<u32,16>(0u,0u,0u,0u,0u,0u,0u,0u,0u,0u,0u,0u,0u,0u,P[42],P[43]);let h=compress(mid,tail);
    let nlo=P[40]+clo;let nc=select(0u,1u,nlo<P[40]);publish(nlo,P[41]+nc,h);
+   if(step+1u<{STEPS}u&&idx+1u<P[5]){{
+    var j=0u;loop{{let pos=62u-j;let wi=pos>>2u;let sh=(3u-(pos&3u))*8u;let digit=(decimal_block[wi]>>sh)&0xffu;if(digit<0x39u){{decimal_block[wi]=(decimal_block[wi]&~(0xffu<<sh))|((digit+1u)<<sh);break;}}decimal_block[wi]=(decimal_block[wi]&~(0xffu<<sh))|(0x30u<<sh);j=j+1u;if(j==9u){{break;}}}}
+   }}
   }} else if(mode==2u){{
    let block=array<u32,16>(P[16],P[17],P[18],P[19],P[20],P[21],P[22],P[23],P[24],clo,0x80000000u,0u,0u,0u,0u,320u);
-   publish(clo,P[24],compress(IV,block));
+   let hs=array<u32,8>(P[40],P[41],P[42],P[43],P[44],P[45],P[46],P[47]);publish(clo,P[24],compress9(IV,hs,block));
   }} else if(mode==3u){{
-   var blocks=array<u32,32>(P[24],P[25],P[26],P[27],P[28],P[29],P[30],P[31],P[32],P[33],P[34],P[35],P[36],P[37],P[38],P[39],P[40],P[41],P[42],P[43],P[44],P[45],P[46],P[47],P[48],P[49],P[50],P[51],P[52],P[53],P[54],P[55]);
-   for(var j=0u;j<P[11];j=j+1u){{let byte=select((clo>>(j*8u))&0xffu,(chi>>((j-4u)*8u))&0xffu,j>=4u);let pos=P[12]+j;let wi=pos>>2u;let sh=(3u-(pos&3u))*8u;blocks[wi]=(blocks[wi]&~(0xffu<<sh))|(byte<<sh);}}
-   let b0=array<u32,16>(blocks[0],blocks[1],blocks[2],blocks[3],blocks[4],blocks[5],blocks[6],blocks[7],blocks[8],blocks[9],blocks[10],blocks[11],blocks[12],blocks[13],blocks[14],blocks[15]);
+   let b0=array<u32,16>(binary_blocks[0],binary_blocks[1],binary_blocks[2],binary_blocks[3],binary_blocks[4],binary_blocks[5],binary_blocks[6],binary_blocks[7],binary_blocks[8],binary_blocks[9],binary_blocks[10],binary_blocks[11],binary_blocks[12],binary_blocks[13],binary_blocks[14],binary_blocks[15]);
    let st=array<u32,8>(P[16],P[17],P[18],P[19],P[20],P[21],P[22],P[23]);var h=compress(st,b0);
-   if(P[10]==2u){{let b1=array<u32,16>(blocks[16],blocks[17],blocks[18],blocks[19],blocks[20],blocks[21],blocks[22],blocks[23],blocks[24],blocks[25],blocks[26],blocks[27],blocks[28],blocks[29],blocks[30],blocks[31]);h=compress(h,b1);}}
+   if(P[10]==2u){{let b1=array<u32,16>(binary_blocks[16],binary_blocks[17],binary_blocks[18],binary_blocks[19],binary_blocks[20],binary_blocks[21],binary_blocks[22],binary_blocks[23],binary_blocks[24],binary_blocks[25],binary_blocks[26],binary_blocks[27],binary_blocks[28],binary_blocks[29],binary_blocks[30],binary_blocks[31]);h=compress(h,b1);}}
    publish(clo,chi,h);
+   if(step+1u<{STEPS}u&&idx+1u<P[5]){{var j=0u;loop{{let pos=P[12]+j;let wi=pos>>2u;let sh=(3u-(pos&3u))*8u;let byte=(binary_blocks[wi]>>sh)&0xffu;if(byte<0xffu){{binary_blocks[wi]=(binary_blocks[wi]&~(0xffu<<sh))|((byte+1u)<<sh);break;}}binary_blocks[wi]=binary_blocks[wi]&~(0xffu<<sh);j=j+1u;if(j==P[11]){{break;}}}}}}
   }}
  }}
 }}
@@ -1966,26 +2068,36 @@ fn target_ok(h0:u32,h1:u32)->bool{{
 }}
 @compute @workgroup_size({WG_SIZE})
 fn solve(@builtin(global_invocation_id) gid:vec3<u32>){{
- let first=P[24]+gid.x*{STEPS}u;
+ let first=P[24]+gid.x*{STEPS}u;if(first>=P[34]){{return;}}
+ var words=array<u32,16>(P[8],P[9],P[10],P[11],P[12],P[13],P[14],P[15],P[16],P[17],P[18],P[19],P[20],P[21],P[22],P[23]);
+ // Format once per invocation. The remaining candidates are generated by an in-place ASCII decimal odometer.
+ var x=first;
+ for(var j=0u;j<9u;j=j+1u){{
+  let digit=x%10u;x=x/10u;let pos=P[25]+8u-j;let wi=pos>>2u;let sh=(3u-(pos&3u))*8u;
+  words[wi]=(words[wi]&~(0xffu<<sh))|((0x30u+digit)<<sh);
+ }}
  for(var step=0u;step<{STEPS}u;step=step+1u){{
   if((step&{}u)==0u&&atomicLoad(&R.flag)!=0u){{return;}}
   let candidate=first+step;if(candidate>=P[34]){{return;}}
-  if((P[33]&1u)!=0u&&candidate%10u==0u){{continue;}}
-  var words=array<u32,16>(P[8],P[9],P[10],P[11],P[12],P[13],P[14],P[15],P[16],P[17],P[18],P[19],P[20],P[21],P[22],P[23]);
-  var x=candidate;
-  for(var j=0u;j<9u;j= j+1u){{
-   let digit=x%10u;x=x/10u;let pos=P[25]+8u-j;let wi=pos>>2u;let sh=(3u-(pos&3u))*8u;
-   words[wi]=(words[wi]&~(0xffu<<sh))|((0x30u+digit)<<sh);
+  if(!((P[33]&1u)!=0u&&candidate%10u==0u)){{
+   var w0=words[0];var w1=words[1];var w2=words[2];var w3=words[3];var w4=words[4];var w5=words[5];var w6=words[6];var w7=words[7];
+   var w8=words[8];var w9=words[9];var w10=words[10];var w11=words[11];var w12=words[12];var w13=words[13];var w14=words[14];var w15=words[15];
+   var a=P[0];var b=P[1];var c=P[2];var d=P[3];var e=P[4];var f=P[5];var g=P[6];var h=P[7];
+   {rounds}
+   let r0=P[0]+a;let r1=P[1]+b;
+   if(target_ok(r0,r1)){{if(atomicExchange(&R.flag,1u)==0u){{
+    let nlo=P[26]+candidate;let carry=select(0u,1u,nlo<P[26]);R.nonce_lo=nlo;R.nonce_hi=P[27]+carry;
+    R.hash[0]=r0;R.hash[1]=r1;R.hash[2]=P[2]+c;R.hash[3]=P[3]+d;R.hash[4]=P[4]+e;R.hash[5]=P[5]+f;R.hash[6]=P[6]+g;R.hash[7]=P[7]+h;
+   }}}}
   }}
-  var w0=words[0];var w1=words[1];var w2=words[2];var w3=words[3];var w4=words[4];var w5=words[5];var w6=words[6];var w7=words[7];
-  var w8=words[8];var w9=words[9];var w10=words[10];var w11=words[11];var w12=words[12];var w13=words[13];var w14=words[14];var w15=words[15];
-  var a=P[0];var b=P[1];var c=P[2];var d=P[3];var e=P[4];var f=P[5];var g=P[6];var h=P[7];
-  {rounds}
-  let r0=P[0]+a;let r1=P[1]+b;
-  if(target_ok(r0,r1)){{if(atomicExchange(&R.flag,1u)==0u){{
-   let nlo=P[26]+candidate;let carry=select(0u,1u,nlo<P[26]);R.nonce_lo=nlo;R.nonce_hi=P[27]+carry;
-   R.hash[0]=r0;R.hash[1]=r1;R.hash[2]=P[2]+c;R.hash[3]=P[3]+d;R.hash[4]=P[4]+e;R.hash[5]=P[5]+f;R.hash[6]=P[6]+g;R.hash[7]=P[7]+h;
-  }}}}
+  if(step+1u<{STEPS}u&&candidate+1u<P[34]){{
+   var j=0u;
+   loop{{
+    let pos=P[25]+8u-j;let wi=pos>>2u;let sh=(3u-(pos&3u))*8u;let digit=(words[wi]>>sh)&0xffu;
+    if(digit<0x39u){{words[wi]=(words[wi]&~(0xffu<<sh))|((digit+1u)<<sh);break;}}
+    words[wi]=(words[wi]&~(0xffu<<sh))|(0x30u<<sh);j=j+1u;if(j==9u){{break;}}
+   }}
+  }}
  }}
 }}
 "#,
