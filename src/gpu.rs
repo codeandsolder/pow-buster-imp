@@ -62,6 +62,7 @@ pub struct GpuContext {
     generic_pipeline: wgpu::ComputePipeline,
     multi_pipeline: wgpu::ComputePipeline,
     cerberus_pipeline: wgpu::ComputePipeline,
+    altcha_pipeline: wgpu::ComputePipeline,
     generic_in_buf: wgpu::Buffer,
     out_buf: wgpu::Buffer,
     staging: wgpu::Buffer,
@@ -69,6 +70,7 @@ pub struct GpuContext {
     generic_bind_group: wgpu::BindGroup,
     multi_bind_group: wgpu::BindGroup,
     cerberus_bind_group: wgpu::BindGroup,
+    altcha_bind_group: wgpu::BindGroup,
     max_wgs: u32,
     adapter: String,
 }
@@ -136,6 +138,18 @@ impl GpuContext {
             label: Some("pow-buster-cerberus"),
             layout: None,
             module: &cerberus_shader,
+            entry_point: Some("solve"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let altcha_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("pow-buster-altcha"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(altcha_shader_source())),
+        });
+        let altcha_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("pow-buster-altcha"),
+            layout: None,
+            module: &altcha_shader,
             entry_point: Some("solve"),
             compilation_options: Default::default(),
             cache: None,
@@ -223,6 +237,21 @@ impl GpuContext {
             ],
         });
 
+        let altcha_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("pow-buster-altcha"),
+            layout: &altcha_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: generic_in_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: out_buf.as_entire_binding(),
+                },
+            ],
+        });
+
         Ok(Self {
             device,
             queue,
@@ -231,6 +260,7 @@ impl GpuContext {
             generic_pipeline,
             multi_pipeline,
             cerberus_pipeline,
+            altcha_pipeline,
             generic_in_buf,
             out_buf,
             staging,
@@ -238,6 +268,7 @@ impl GpuContext {
             generic_bind_group,
             multi_bind_group,
             cerberus_bind_group,
+            altcha_bind_group,
             max_wgs: limits.max_compute_workgroups_per_dimension,
             adapter: adapter_name,
         })
@@ -660,6 +691,41 @@ impl GpuContext {
         let hash = values[3..11]
             .try_into()
             .map_err(|_| GpuError::new("invalid GPU Cerberus result layout"))?;
+        Ok(Some((nonce, hash)))
+    }
+
+    async fn dispatch_altcha(
+        &mut self,
+        params: &[u32; 64],
+        workgroups: u32,
+    ) -> Result<Option<(u64, [u32; 8])>, GpuError> {
+        self.queue.write_buffer(&self.out_buf, 0, &[0; 48]);
+        self.queue
+            .write_buffer(&self.generic_in_buf, 0, bytemuck::cast_slice(params));
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("pow-buster-altcha"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("pow-buster-altcha"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.altcha_pipeline);
+            pass.set_bind_group(0, &self.altcha_bind_group, &[]);
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&self.out_buf, 0, &self.staging, 0, 48);
+        self.queue.submit([encoder.finish()]);
+        let values = self.read_result().await?;
+        if values[0] == 0 {
+            return Ok(None);
+        }
+        let nonce = (u64::from(values[2]) << 32) | u64::from(values[1]);
+        let hash = values[3..11]
+            .try_into()
+            .map_err(|_| GpuError::new("invalid GPU Altcha result layout"))?;
         Ok(Some((nonce, hash)))
     }
 
@@ -1193,6 +1259,102 @@ impl CerberusSolver {
     }
 }
 
+/// Async GPU counterpart of the CPU Altcha SHA-256/PBKDF2 solver.
+pub struct AltchaSha256Solver {
+    message: crate::message::AltchaMessage,
+    attempted_nonces: u64,
+    limit: u64,
+}
+
+impl From<crate::message::AltchaMessage> for AltchaSha256Solver {
+    fn from(message: crate::message::AltchaMessage) -> Self {
+        Self {
+            message,
+            attempted_nonces: 0,
+            limit: u64::MAX,
+        }
+    }
+}
+
+impl AltchaSha256Solver {
+    /// Set the maximum number of candidates dispatched.
+    pub fn set_limit(&mut self, limit: u64) {
+        self.limit = limit;
+    }
+
+    /// Number of candidates dispatched so far.
+    pub fn get_attempted_nonces(&self) -> u64 {
+        self.attempted_nonces
+    }
+
+    /// Solve an Altcha SHA-256 or PBKDF2 challenge on the GPU.
+    pub async fn solve<const TYPE: u8>(
+        &mut self,
+        gpu: &mut GpuContext,
+        target: u64,
+        mask: u64,
+    ) -> Result<Option<GpuSolution>, GpuError> {
+        let limit = self.limit.min(u64::from(u32::MAX));
+        let desired = expected_work_full64::<TYPE>(target, mask)
+            .saturating_mul(4)
+            .max(u64::from(WG_SIZE));
+        let max_batch = u64::from(gpu.max_wgs) * u64::from(WG_SIZE);
+        let mut base = 0_u64;
+        while base < limit {
+            let batch = desired
+                .min(limit - base)
+                .min(max_batch)
+                .min(u64::from(u32::MAX));
+            let wgs = batch.div_ceil(u64::from(WG_SIZE)).max(1) as u32;
+            let mut p = [0_u32; 64];
+            p[0] = u32::from(self.message.pbkdf2);
+            p[1] = base as u32;
+            p[2] = batch as u32;
+            p[3] = u32::from(TYPE);
+            p[4] = (target >> 32) as u32;
+            p[5] = target as u32;
+            p[6] = (mask >> 32) as u32;
+            p[7] = mask as u32;
+            p[8] = self.message.cost.get();
+            p[9] = self.message.key_length.get().min(32);
+            for i in 0..4 {
+                p[16 + i] =
+                    u32::from_be_bytes(self.message.salt[i * 4..i * 4 + 4].try_into().unwrap());
+                p[20 + i] =
+                    u32::from_be_bytes(self.message.nonce[i * 4..i * 4 + 4].try_into().unwrap());
+            }
+
+            if let Some((nonce, hash)) = gpu.dispatch_altcha(&p, wgs).await? {
+                self.attempted_nonces = base + batch;
+                if !verify_altcha::<TYPE>(&self.message, nonce, hash, target, mask) {
+                    return Err(GpuError::new("GPU returned an invalid Altcha proof"));
+                }
+                return Ok(Some(GpuSolution {
+                    nonce,
+                    hash,
+                    dispatched_hashes: self.attempted_nonces,
+                }));
+            }
+            base += batch;
+        }
+        self.attempted_nonces = limit;
+        Ok(None)
+    }
+
+    /// Solve and return only the nonce.
+    pub async fn solve_nonce_only<const TYPE: u8>(
+        &mut self,
+        gpu: &mut GpuContext,
+        target: u64,
+        mask: u64,
+    ) -> Result<Option<u64>, GpuError> {
+        Ok(self
+            .solve::<TYPE>(gpu, target, mask)
+            .await?
+            .map(|solution| solution.nonce))
+    }
+}
+
 fn single_block_search_space(message: &crate::message::SingleBlockMessage) -> u64 {
     if message.nonce_addend == 0 {
         900_000_000
@@ -1400,6 +1562,123 @@ fn verify_cerberus(
         }
     };
     expected == hash && ((((hash[0] as u64) << 32) | u64::from(hash[1])) & mask) == 0
+}
+
+fn expected_work_full64<const TYPE: u8>(target: u64, mask: u64) -> u64 {
+    if TYPE == crate::solver::SOLVE_TYPE_MASK {
+        return 1_u64.checked_shl(mask.count_ones()).unwrap_or(u64::MAX);
+    }
+    let space = 1_u128 << 64;
+    let t = u128::from(target);
+    let success = if TYPE == crate::solver::SOLVE_TYPE_LT {
+        t.max(1)
+    } else {
+        space.saturating_sub(t).saturating_sub(1).max(1)
+    };
+    (space / success).min(u128::from(u64::MAX)) as u64
+}
+
+fn result_matches_full64<const TYPE: u8>(hash: [u32; 8], target: u64, mask: u64) -> bool {
+    let value = (u64::from(hash[0]) << 32) | u64::from(hash[1]);
+    if TYPE == crate::solver::SOLVE_TYPE_LT {
+        value < target
+    } else if TYPE == crate::solver::SOLVE_TYPE_GT {
+        value > target
+    } else {
+        (value & mask) == (target & mask)
+    }
+}
+
+fn verify_altcha<const TYPE: u8>(
+    message: &crate::message::AltchaMessage,
+    nonce: u64,
+    hash: [u32; 8],
+    target: u64,
+    mask: u64,
+) -> bool {
+    let Ok(counter) = u32::try_from(nonce) else {
+        return false;
+    };
+    let expected = if message.pbkdf2 {
+        let mut password = [0_u8; 20];
+        password[..16].copy_from_slice(&message.nonce);
+        password[16..].copy_from_slice(&counter.to_be_bytes());
+        let mut output = [0_u8; 32];
+        if pbkdf2::pbkdf2::<pbkdf2::hmac::Hmac<Sha256>>(
+            &password,
+            &message.salt,
+            message.cost.get(),
+            &mut output,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        core::array::from_fn(|i| u32::from_be_bytes(output[i * 4..i * 4 + 4].try_into().unwrap()))
+    } else {
+        let mut first = [0_u8; 36];
+        first[..16].copy_from_slice(&message.salt);
+        first[16..32].copy_from_slice(&message.nonce);
+        first[32..].copy_from_slice(&counter.to_be_bytes());
+        let mut digest = Sha256::digest(first).to_vec();
+        let key_len = message.key_length.get().min(32) as usize;
+        for _ in 1..message.cost.get() {
+            digest = Sha256::digest(&digest[..key_len]).to_vec();
+        }
+        core::array::from_fn(|i| u32::from_be_bytes(digest[i * 4..i * 4 + 4].try_into().unwrap()))
+    };
+    expected == hash && result_matches_full64::<TYPE>(hash, target, mask)
+}
+
+fn altcha_shader_source() -> String {
+    let constants = crate::sha256::K32
+        .iter()
+        .map(|k| format!("0x{k:08x}u"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"
+const K:array<u32,64>=array<u32,64>({constants});
+const IV:array<u32,8>=array<u32,8>(0x6a09e667u,0xbb67ae85u,0x3c6ef372u,0xa54ff53au,0x510e527fu,0x9b05688cu,0x1f83d9abu,0x5be0cd19u);
+struct OutBuf {{ flag:atomic<u32>,nonce_lo:u32,nonce_hi:u32,hash:array<u32,8> }};
+@group(0) @binding(0) var<storage,read> P:array<u32>;
+@group(0) @binding(1) var<storage,read_write> R:OutBuf;
+fn rotr(x:u32,n:u32)->u32{{return (x>>n)|(x<<(32u-n));}}
+fn compress(s:array<u32,8>,block:array<u32,16>)->array<u32,8>{{
+ var w:array<u32,64>;for(var i=0u;i<16u;i=i+1u){{w[i]=block[i];}}
+ for(var i=16u;i<64u;i=i+1u){{let s0=rotr(w[i-15u],7u)^rotr(w[i-15u],18u)^(w[i-15u]>>3u);let s1=rotr(w[i-2u],17u)^rotr(w[i-2u],19u)^(w[i-2u]>>10u);w[i]=w[i-16u]+s0+w[i-7u]+s1;}}
+ var a=s[0];var b=s[1];var c=s[2];var d=s[3];var e=s[4];var f=s[5];var g=s[6];var h=s[7];
+ for(var i=0u;i<64u;i=i+1u){{let t1=h+(rotr(e,6u)^rotr(e,11u)^rotr(e,25u))+(g^(e&(f^g)))+K[i]+w[i];let t2=(rotr(a,2u)^rotr(a,13u)^rotr(a,22u))+((a&b)^(a&c)^(b&c));h=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=t1+t2;}}
+ return array<u32,8>(s[0]+a,s[1]+b,s[2]+c,s[3]+d,s[4]+e,s[5]+f,s[6]+g,s[7]+h);
+}}
+fn target_ok(h0:u32,h1:u32)->bool{{
+ let ty=P[3];if(ty==1u){{return h0<P[4]||(h0==P[4]&&h1<P[5]);}}if(ty==2u){{return h0>P[4]||(h0==P[4]&&h1>P[5]);}}return (h0&P[6])==(P[4]&P[6])&&(h1&P[7])==(P[5]&P[7]);
+}}
+fn hash_prefix(h:array<u32,8>,len:u32)->array<u32,8>{{
+ var b:array<u32,16>;for(var i=0u;i<16u;i=i+1u){{b[i]=0u;}}
+ for(var j=0u;j<len;j=j+1u){{let wi=j>>2u;let sh=(3u-(j&3u))*8u;let byte=(h[wi]>>sh)&0xffu;b[wi]=b[wi]|(byte<<sh);}}
+ let wi=len>>2u;let sh=(3u-(len&3u))*8u;b[wi]=b[wi]|(0x80u<<sh);b[15]=len*8u;return compress(IV,b);
+}}
+fn hmac(ipad:array<u32,8>,opad:array<u32,8>,msg:array<u32,8>,words:u32,tail_word:u32,bytes:u32)->array<u32,8>{{
+ var b:array<u32,16>;for(var i=0u;i<16u;i=i+1u){{b[i]=0u;}}for(var i=0u;i<words;i=i+1u){{b[i]=msg[i];}}if(words<8u){{b[words]=tail_word;}}let padpos=bytes;let pwi=padpos>>2u;let psh=(3u-(padpos&3u))*8u;b[pwi]=b[pwi]|(0x80u<<psh);b[15]=(64u+bytes)*8u;let inner=compress(ipad,b);
+ var o:array<u32,16>;for(var i=0u;i<16u;i=i+1u){{o[i]=0u;}}for(var i=0u;i<8u;i=i+1u){{o[i]=inner[i];}}o[8]=0x80000000u;o[15]=768u;return compress(opad,o);
+}}
+@compute @workgroup_size({WG_SIZE})
+fn solve(@builtin(global_invocation_id) gid:vec3<u32>){{
+ let idx=gid.x;if(idx>=P[2]||atomicLoad(&R.flag)!=0u){{return;}}let candidate=P[1]+idx;var out:array<u32,8>;
+ if(P[0]==0u){{
+  var b=array<u32,16>(P[16],P[17],P[18],P[19],P[20],P[21],P[22],P[23],candidate,0x80000000u,0u,0u,0u,0u,0u,288u);out=compress(IV,b);
+  for(var r=1u;r<P[8];r=r+1u){{out=hash_prefix(out,P[9]);}}
+ }}else{{
+  var ib:array<u32,16>;var ob:array<u32,16>;for(var i=0u;i<16u;i=i+1u){{ib[i]=0x36363636u;ob[i]=0x5c5c5c5cu;}}
+  for(var i=0u;i<4u;i=i+1u){{ib[i]=ib[i]^P[20+i];ob[i]=ob[i]^P[20+i];}}ib[4]=ib[4]^candidate;ob[4]=ob[4]^candidate;let ipad=compress(IV,ib);let opad=compress(IV,ob);
+  var sm:array<u32,8>;for(var i=0u;i<4u;i=i+1u){{sm[i]=P[16+i];}}for(var i=4u;i<8u;i=i+1u){{sm[i]=0u;}}var u=hmac(ipad,opad,sm,4u,1u,20u);var acc=u;
+  for(var r=1u;r<P[8];r=r+1u){{u=hmac(ipad,opad,u,8u,0u,32u);for(var i=0u;i<8u;i=i+1u){{acc[i]=acc[i]^u[i];}}}}out=acc;
+ }}
+ if(target_ok(out[0],out[1])&&atomicExchange(&R.flag,1u)==0u){{R.nonce_lo=candidate;R.nonce_hi=0u;for(var i=0u;i<8u;i=i+1u){{R.hash[i]=out[i];}}}}
+}}
+"#
+    )
 }
 
 fn cerberus_shader_source() -> String {
