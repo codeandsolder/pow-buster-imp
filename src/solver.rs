@@ -17,6 +17,18 @@ pub mod simd128;
 /// Safe solver
 pub mod safe;
 
+#[inline(always)]
+pub(crate) fn increment_ascii_decimal(digits: &mut [u8]) -> bool {
+    for digit in digits.iter_mut().rev() {
+        if *digit != b'9' {
+            *digit += 1;
+            return false;
+        }
+        *digit = b'0';
+    }
+    true
+}
+
 /// Less than test (such as Anubis and GoAway)
 pub const SOLVE_TYPE_LT: u8 = 1;
 /// Greater than test (such as mCaptcha)

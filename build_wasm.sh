@@ -2,7 +2,7 @@
 
 set -e
 
-RUSTFLAGS='-Ctarget-feature=+simd128' wasm-pack build --target web -d pkg --no-default-features --features adapter
+RUSTFLAGS='-Ctarget-feature=+simd128' wasm-pack build --target web -d pkg --no-default-features --features json
 
 for file in pkg/*.wasm; do
   gzip -9knf "$file"

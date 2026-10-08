@@ -1286,7 +1286,7 @@ impl CerberusSolver {
         let desired = gpu_batch_target(expected, HASHES_PER_WG);
         let search_space = match &self.message {
             crate::message::CerberusMessage::Decimal(_) => 1_000_000_000_u64,
-            crate::message::CerberusMessage::Binary(_) => u64::from(u32::MAX),
+            crate::message::CerberusMessage::Binary(_) => u64::from(u32::MAX) + 1,
         };
         let limit = self.limit.min(search_space);
         let mut base = 0_u64;
@@ -1389,7 +1389,7 @@ impl AltchaSha256Solver {
         target: u64,
         mask: u64,
     ) -> Result<Option<GpuSolution>, GpuError> {
-        let limit = self.limit.min(u64::from(u32::MAX));
+        let limit = self.limit.min(u64::from(u32::MAX) + 1);
         let desired = gpu_batch_target(
             expected_work_full64::<TYPE>(target, mask),
             u64::from(WG_SIZE),

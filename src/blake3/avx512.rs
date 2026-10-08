@@ -16,7 +16,7 @@ pub(crate) fn compress_mb16<const CONSTANT_WORD_COUNT: usize, const PATCH_1: usi
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_feature = "avx512f"))]
 #[inline(always)]
 fn g4(a: &mut __m512i, b: &mut __m512i, c: &mut __m512i, d: &mut __m512i, x: __m512i, y: __m512i) {
     let mut aa: u32x16 = (*a).into();
