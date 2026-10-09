@@ -27,7 +27,7 @@ tokio = { version = "1", features = ["rt", "net", "macros"], optional = true }
 rayon = { version = "1.10", optional = true }
 num_cpus = { version = "1.17", optional = true }
 thiserror = { version = "2", optional = true }
-scraper = { version = "0.25", optional = true }
+scraper = { version = "0.27", optional = true }
 url = { version = "2.5", optional = true }
 axum = { version = "0.8", features = ["http2"], optional = true }
 tower-http = { version = "0.6.6", features = ["catch-panic", "timeout", "trace", "limit"], optional = true }
