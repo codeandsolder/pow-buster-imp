@@ -30,7 +30,7 @@ thiserror = { version = "2", optional = true }
 scraper = { version = "0.25", optional = true }
 url = { version = "2.5", optional = true }
 axum = { version = "0.8", features = ["http2"], optional = true }
-tower-http = { version = "0.6.6", features = ["catch-panic", "timeout", "trace", "limit"], optional = true }
+tower-http = { version = "0.7.0", features = ["catch-panic", "timeout", "trace", "limit"], optional = true }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"], optional = true }
 tracing = { version = "0.1.41", optional = true }
 axum-extra = { version = "0.12.5", features = ["typed-header"], optional = true }
