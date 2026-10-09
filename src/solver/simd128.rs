@@ -689,6 +689,10 @@ impl CerberusSolver {
             }
             msg[CENTER_WORD_IDX] = u32::from_be_bytes(word_digits);
             for lane_id_idx in 0..(LANE_ID_STR_COMBINED_LE_HI.len() / 4) {
+                if self.attempted_nonces >= self.limit {
+                    return None;
+                }
+                let valid_lanes = (self.limit - self.attempted_nonces).min(4) as usize;
                 unsafe {
                     let mut lane_id_value = v128_load(
                         LANE_ID_STR_COMBINED_LE_HI
@@ -708,17 +712,24 @@ impl CerberusSolver {
 
                     let masked = v128_and(state[0], u32x4_splat(mask));
 
-                    self.attempted_nonces += 4;
+                    self.attempted_nonces += valid_lanes as u64;
 
                     if !u32x4_all_true(masked) {
                         crate::unlikely();
 
                         let mut extract = [0u32; 4];
                         v128_store(extract.as_mut_ptr().cast(), masked);
-                        let success_lane_idx =
-                            extract.iter().position(|x| *x & mask == 0).unwrap() as u64;
-
-                        return Some((word as u64, lane_id_idx as u64 * 4 + success_lane_idx));
+                        if let Some(success_lane_idx) =
+                            extract[..valid_lanes].iter().position(|x| *x & mask == 0)
+                        {
+                            return Some((
+                                word as u64,
+                                lane_id_idx as u64 * 4 + success_lane_idx as u64,
+                            ));
+                        }
+                    }
+                    if valid_lanes < 4 {
+                        return None;
                     }
                 }
             }

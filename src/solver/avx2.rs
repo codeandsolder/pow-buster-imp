@@ -1564,7 +1564,11 @@ impl CerberusSolver {
                     _mm256_or_epi32(_mm256_set1_epi32(msg[LANE_ID_WORD_IDX] as _), lane_id_value);
                 let maskv = _mm256_set1_epi32((mask >> 32) as _);
 
-                for (i, word) in crate::strings::DIGIT_LUT_10000_LE_EVEN.iter().enumerate() {
+                let lut = &crate::strings::DIGIT_LUT_10000_LE_EVEN;
+                let remaining = self.limit - self.attempted_nonces;
+                let full_pairs = ((remaining / 16) as usize).min(lut.len());
+
+                for (i, word) in lut.iter().take(full_pairs).enumerate() {
                     msg[CENTER_WORD_IDX] = *word;
 
                     let mut state = state_base;
@@ -1615,6 +1619,54 @@ impl CerberusSolver {
 
                         return Some((word_idx, lane_id_idx as u64 * 8 + success_lane_idx as u64));
                     }
+                }
+
+                if full_pairs < lut.len() {
+                    let tail = (self.limit - self.attempted_nonces) as usize;
+                    if tail == 0 {
+                        return None;
+                    }
+                    debug_assert!(tail < 16);
+                    let i = full_pairs;
+                    let word = lut[i];
+                    msg[CENTER_WORD_IDX] = word;
+                    let mut state = state_base;
+                    crate::blake3::avx2::compress_mb8::<CONSTANT_WORD_COUNT, LANE_ID_WORD_IDX>(
+                        &mut state, &msg, patch,
+                    );
+                    let sm0 = _mm256_and_si256(state[0], maskv);
+                    let valid0 = tail.min(8);
+                    self.attempted_nonces += valid0 as u64;
+                    let mut dump = Align64([0u32; 8]);
+                    _mm256_store_si256(dump.as_mut_ptr().cast(), sm0);
+                    if let Some(success_lane_idx) = dump.0[..valid0].iter().position(|x| *x == 0) {
+                        return Some((
+                            i as u64 * 2,
+                            lane_id_idx as u64 * 8 + success_lane_idx as u64,
+                        ));
+                    }
+                    if valid0 < 8 {
+                        return None;
+                    }
+                    let valid1 = tail - 8;
+                    if valid1 == 0 {
+                        return None;
+                    }
+                    msg[CENTER_WORD_IDX] = word | u32::from_be_bytes([1, 0, 0, 0]);
+                    state = state_base;
+                    crate::blake3::avx2::compress_mb8::<CONSTANT_WORD_COUNT, LANE_ID_WORD_IDX>(
+                        &mut state, &msg, patch,
+                    );
+                    let sm1 = _mm256_and_si256(state[0], maskv);
+                    self.attempted_nonces += valid1 as u64;
+                    _mm256_store_si256(dump.as_mut_ptr().cast(), sm1);
+                    if let Some(success_lane_idx) = dump.0[..valid1].iter().position(|x| *x == 0) {
+                        return Some((
+                            i as u64 * 2 + 1,
+                            lane_id_idx as u64 * 8 + success_lane_idx as u64,
+                        ));
+                    }
+                    return None;
                 }
             }
         }
@@ -2321,6 +2373,20 @@ mod tests {
                 Some(CerberusMessage::Decimal(CerberusDecimalMessage::new(prefix, i)?).into())
             });
         }
+    }
+
+    #[test]
+    fn test_cerberus_decimal_exact_limit() {
+        let message = CerberusDecimalMessage::new(b"cerberus-decimal-benchmark|", 0)
+            .expect("valid Cerberus decimal message");
+        let mut solver = CerberusSolver::from(CerberusMessage::Decimal(message));
+        solver.set_limit(17);
+        assert!(
+            solver
+                .solve::<{ crate::solver::SOLVE_TYPE_MASK }>(0, u64::MAX)
+                .is_none()
+        );
+        assert_eq!(solver.get_attempted_nonces(), 17);
     }
 
     #[test]
