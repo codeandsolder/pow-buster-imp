@@ -36,6 +36,7 @@ mod tests {
     use blake3::Hasher;
 
     use super::*;
+    use crate::blake3::g;
 
     #[test]
     fn test_g_function() {
