@@ -877,19 +877,17 @@ impl BinarySolver {
         for i in 0..16 {
             lane_id_base[i as usize] = i << (lane_id_byte_remainder * 8);
         }
-        let lane_id_iterand = 16 << (lane_id_byte_remainder * 8);
-
         let mut memo_state = prefix_state;
         crate::sha256::ingest_message_prefix::<FIRST_NONCE_WORD_IDX>(
             &mut memo_state,
             first_block[..FIRST_NONCE_WORD_IDX].try_into().unwrap(),
         );
 
-        for x in 0..(self
-            .limit
-            .min(256u64.saturating_pow(nonce_byte_count_decr as u32))
-            .max(1))
-        {
+        let candidate_space = 256u64.saturating_pow(nonce_byte_count.get() as u32);
+        let search_end = self.limit.min(candidate_space);
+        let mut cursor = self.attempted_nonces.min(search_end);
+        while cursor < search_end {
+            let x = cursor >> 8;
             unsafe {
                 let mut block_tpl = *first_block;
                 let xm = _mm_cvtsi64x_si128(x as _);
@@ -899,9 +897,15 @@ impl BinarySolver {
                     block_tpl.as_mut_ptr().add(poke_word_base).cast(),
                     _mm_or_si128(loadd, xmd),
                 );
-                let mut lane_id_v = _mm512_load_si512(lane_id_base.as_ptr().cast());
 
-                for lane_id_set_idx in 0..(256 / 16) {
+                let mut lane_base = (cursor & 0xff) as usize;
+                while lane_base < 256 && cursor < search_end {
+                    let valid_lanes =
+                        (search_end - cursor).min(16).min((256 - lane_base) as u64) as usize;
+                    let lane_id_v = _mm512_add_epi32(
+                        _mm512_load_si512(lane_id_base.as_ptr().cast()),
+                        _mm512_set1_epi32(((lane_base as u32) << lane_id_byte_remainder * 8) as _),
+                    );
                     macro_rules! get_msg {
                         ($idx:expr) => {
                             if $idx == FIRST_NONCE_WORD_IDX {
@@ -1014,28 +1018,51 @@ impl BinarySolver {
                     #[cfg(not(feature = "compare-64bit"))]
                     let met_target_test = met_target != 0;
 
+                    cursor += valid_lanes as u64;
+                    self.attempted_nonces = cursor;
+
                     if met_target_test {
                         crate::unlikely();
-
-                        #[cfg(not(feature = "compare-64bit"))]
-                        let success_lane_idx = met_target.trailing_zeros() as usize;
+                        let mut a = Align64([0u32; 16]);
+                        _mm512_store_si512(a.as_mut_ptr().cast(), state[0]);
                         #[cfg(feature = "compare-64bit")]
-                        let success_lane_idx = INDEX_REMAP_PUNPCKLDQ
-                            [(met_target_high << 8 | met_target_lo).trailing_zeros() as usize];
+                        let mut b = Align64([0u32; 16]);
+                        #[cfg(feature = "compare-64bit")]
+                        _mm512_store_si512(b.as_mut_ptr().cast(), state[1]);
 
-                        let nonce_addend = 16 * lane_id_set_idx + success_lane_idx;
+                        let success_lane_idx = (0..valid_lanes).find(|&lane| {
+                            #[cfg(feature = "compare-64bit")]
+                            {
+                                let value = (u64::from(a[lane]) << 32) | u64::from(b[lane]);
+                                if TYPE == crate::solver::SOLVE_TYPE_GT {
+                                    value > target
+                                } else if TYPE == crate::solver::SOLVE_TYPE_LT {
+                                    value < target
+                                } else {
+                                    value & mask == target & mask
+                                }
+                            }
+                            #[cfg(not(feature = "compare-64bit"))]
+                            {
+                                let value = a[lane];
+                                let target_hi = (target >> 32) as u32;
+                                let mask_hi = (mask >> 32) as u32;
+                                if TYPE == crate::solver::SOLVE_TYPE_GT {
+                                    value > target_hi
+                                } else if TYPE == crate::solver::SOLVE_TYPE_LT {
+                                    value < target_hi
+                                } else {
+                                    value & mask_hi == target_hi & mask_hi
+                                }
+                            }
+                        });
 
-                        let nonce = x << 8 | nonce_addend as u64;
-
-                        return Some(nonce);
+                        if let Some(success_lane_idx) = success_lane_idx {
+                            return Some((x << 8) | (lane_base + success_lane_idx) as u64);
+                        }
                     }
 
-                    lane_id_v = _mm512_add_epi32(lane_id_v, _mm512_set1_epi32(lane_id_iterand));
-                    self.attempted_nonces += 16;
-                }
-
-                if self.attempted_nonces >= self.limit {
-                    return None;
+                    lane_base += valid_lanes;
                 }
             }
         }
@@ -1222,13 +1249,16 @@ impl GoAwaySolver {
         let mut prefix_state = crate::sha256::IV;
         crate::sha256::ingest_message_prefix(&mut prefix_state, self.message.challenge);
 
-        let remaining_limit = self.limit.min(u32::MAX as u64) as u32;
+        let search_end = self.limit.min(u64::from(u32::MAX) + 1);
 
         {
             let mut partial_state = prefix_state;
             crate::sha256::sha2_arx::<8>(&mut partial_state, &[self.message.high_word]);
 
-            for low_word in (0..=remaining_limit).step_by(16) {
+            let mut low_word = self.attempted_nonces.min(search_end);
+            while low_word < search_end {
+                let valid_lanes = (search_end - low_word).min(16) as usize;
+                let low_word_u32 = low_word as u32;
                 let mut state = core::array::from_fn(|i| _mm512_set1_epi32(partial_state[i] as _));
 
                 let mut msg = [
@@ -1241,7 +1271,7 @@ impl GoAwaySolver {
                     _mm512_set1_epi32(self.message.challenge[6] as _),
                     _mm512_set1_epi32(self.message.challenge[7] as _),
                     _mm512_set1_epi32(self.message.high_word as _),
-                    _mm512_or_epi32(_mm512_set1_epi32(low_word as _), lane_id_v),
+                    _mm512_add_epi32(_mm512_set1_epi32(low_word_u32 as _), lane_id_v),
                     _mm512_set1_epi32(u32::from_be_bytes([0x80, 0, 0, 0]) as _),
                     _mm512_setzero_epi32(),
                     _mm512_setzero_epi32(),
@@ -1308,26 +1338,44 @@ impl GoAwaySolver {
                 #[cfg(not(feature = "compare-64bit"))]
                 let met_target_test = met_target != 0;
 
-                self.attempted_nonces += 16;
+                self.attempted_nonces += valid_lanes as u64;
 
                 if met_target_test {
                     crate::unlikely();
-
-                    #[cfg(not(feature = "compare-64bit"))]
-                    let success_lane_idx = met_target.trailing_zeros();
-
+                    let mut a = Align64([0u32; 16]);
+                    unsafe { _mm512_store_si512(a.as_mut_ptr().cast(), state[0]) };
                     #[cfg(feature = "compare-64bit")]
-                    let success_lane_idx = INDEX_REMAP_PUNPCKLDQ
-                        [(met_target_high << 8 | met_target_lo).trailing_zeros() as usize];
+                    let mut b = Align64([0u32; 16]);
+                    #[cfg(feature = "compare-64bit")]
+                    unsafe {
+                        _mm512_store_si512(b.as_mut_ptr().cast(), state[1])
+                    };
 
-                    let final_low_word = low_word | (success_lane_idx as u32);
+                    let success_lane_idx = (0..valid_lanes).find(|&lane| {
+                        #[cfg(feature = "compare-64bit")]
+                        let value = (u64::from(a[lane]) << 32) | u64::from(b[lane]);
+                        #[cfg(not(feature = "compare-64bit"))]
+                        let value = a[lane];
+                        #[cfg(not(feature = "compare-64bit"))]
+                        let target = (target >> 32) as u32;
+                        #[cfg(not(feature = "compare-64bit"))]
+                        let mask = (mask >> 32) as u32;
+                        if TYPE == crate::solver::SOLVE_TYPE_GT {
+                            value > target
+                        } else if TYPE == crate::solver::SOLVE_TYPE_LT {
+                            value < target
+                        } else {
+                            value & mask == target & mask
+                        }
+                    });
 
-                    return Some((self.message.high_word as u64) << 32 | final_low_word as u64);
+                    if let Some(success_lane_idx) = success_lane_idx {
+                        let final_low_word = low_word_u32.wrapping_add(success_lane_idx as u32);
+                        return Some((self.message.high_word as u64) << 32 | final_low_word as u64);
+                    }
                 }
 
-                if self.attempted_nonces >= self.limit {
-                    return None;
-                }
+                low_word += valid_lanes as u64;
             }
         }
         None
@@ -1435,7 +1483,11 @@ impl CerberusSolver {
                     _mm512_or_epi32(_mm512_set1_epi32(msg[LANE_ID_WORD_IDX] as _), lane_id_value);
                 let maskv = _mm512_set1_epi32((mask >> 32) as _);
 
-                for (i, word) in crate::strings::DIGIT_LUT_10000_LE_EVEN.iter().enumerate() {
+                let lut = &crate::strings::DIGIT_LUT_10000_LE_EVEN;
+                let remaining = self.limit - self.attempted_nonces;
+                let full_pairs = ((remaining / 32) as usize).min(lut.len());
+
+                for (i, word) in lut.iter().take(full_pairs).enumerate() {
                     msg[CENTER_WORD_IDX] = *word;
 
                     let mut state = state_base;
@@ -1477,6 +1529,63 @@ impl CerberusSolver {
                             ));
                         }
                     }
+                }
+
+                if full_pairs < lut.len() {
+                    let tail = (self.limit - self.attempted_nonces) as usize;
+                    if tail == 0 {
+                        return None;
+                    }
+                    debug_assert!(tail < 32);
+                    let i = full_pairs;
+                    let word = lut[i];
+                    msg[CENTER_WORD_IDX] = word;
+                    let mut state = state_base;
+                    crate::blake3::avx512::compress_mb16::<CONSTANT_WORD_COUNT, LANE_ID_WORD_IDX>(
+                        &mut state, &msg, patch,
+                    );
+                    let mut hit0 = _mm512_testn_epi32_mask(state[0], maskv);
+                    let valid0 = tail.min(16);
+                    let valid_mask0 = if valid0 == 16 {
+                        u16::MAX
+                    } else {
+                        (1u16 << valid0) - 1
+                    };
+                    hit0 &= valid_mask0;
+                    self.attempted_nonces += valid0 as u64;
+                    if hit0 != 0 {
+                        return Some((
+                            i as u64 * 2,
+                            lane_id_idx as u64 * 16 + hit0.trailing_zeros() as u64,
+                        ));
+                    }
+                    if valid0 < 16 {
+                        return None;
+                    }
+                    let valid1 = tail - 16;
+                    if valid1 == 0 {
+                        return None;
+                    }
+                    msg[CENTER_WORD_IDX] = word | u32::from_be_bytes([1, 0, 0, 0]);
+                    state = state_base;
+                    crate::blake3::avx512::compress_mb16::<CONSTANT_WORD_COUNT, LANE_ID_WORD_IDX>(
+                        &mut state, &msg, patch,
+                    );
+                    let mut hit1 = _mm512_testn_epi32_mask(state[0], maskv);
+                    let valid_mask1 = if valid1 == 16 {
+                        u16::MAX
+                    } else {
+                        (1u16 << valid1) - 1
+                    };
+                    hit1 &= valid_mask1;
+                    self.attempted_nonces += valid1 as u64;
+                    if hit1 != 0 {
+                        return Some((
+                            i as u64 * 2 + 1,
+                            lane_id_idx as u64 * 16 + hit1.trailing_zeros() as u64,
+                        ));
+                    }
+                    return None;
                 }
             }
         }

@@ -13,6 +13,9 @@ use core::num::NonZeroU8;
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+#[cfg(feature = "json")]
+use serde_json as _;
+
 #[cfg(feature = "client")]
 /// Web client for end-to-end PoW solving
 pub mod client;
@@ -25,10 +28,10 @@ pub mod server;
 /// GPU solver backend using native `wgpu` or browser WebGPU.
 pub mod gpu;
 
-#[cfg(all(target_arch = "wasm32", feature = "adapter"))]
+#[cfg(all(target_arch = "wasm32", feature = "json"))]
 mod wasm_ffi;
 
-#[cfg(all(target_arch = "wasm32", feature = "gpu"))]
+#[cfg(all(target_arch = "wasm32", feature = "gpu", feature = "json"))]
 mod gpu_wasm_ffi;
 
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]

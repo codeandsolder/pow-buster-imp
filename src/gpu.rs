@@ -1286,7 +1286,7 @@ impl CerberusSolver {
         let desired = gpu_batch_target(expected, HASHES_PER_WG);
         let search_space = match &self.message {
             crate::message::CerberusMessage::Decimal(_) => 1_000_000_000_u64,
-            crate::message::CerberusMessage::Binary(_) => u64::from(u32::MAX),
+            crate::message::CerberusMessage::Binary(_) => u64::from(u32::MAX) + 1,
         };
         let limit = self.limit.min(search_space);
         let mut base = 0_u64;
@@ -1389,7 +1389,7 @@ impl AltchaSha256Solver {
         target: u64,
         mask: u64,
     ) -> Result<Option<GpuSolution>, GpuError> {
-        let limit = self.limit.min(u64::from(u32::MAX));
+        let limit = self.limit.min(u64::from(u32::MAX) + 1);
         let desired = gpu_batch_target(
             expected_work_full64::<TYPE>(target, mask),
             u64::from(WG_SIZE),
@@ -2076,10 +2076,12 @@ fn solve(@builtin(global_invocation_id) gid:vec3<u32>){{
   let digit=x%10u;x=x/10u;let pos=P[25]+8u-j;let wi=pos>>2u;let sh=(3u-(pos&3u))*8u;
   words[wi]=(words[wi]&~(0xffu<<sh))|((0x30u+digit)<<sh);
  }}
+ let last_pos=P[25]+8u;let last_wi=last_pos>>2u;let last_sh=(3u-(last_pos&3u))*8u;
  for(var step=0u;step<{STEPS}u;step=step+1u){{
   if((step&{}u)==0u&&atomicLoad(&R.flag)!=0u){{return;}}
   let candidate=first+step;if(candidate>=P[34]){{return;}}
-  if(!((P[33]&1u)!=0u&&candidate%10u==0u)){{
+  let trailing_zero=((words[last_wi]>>last_sh)&0xffu)==0x30u;
+  if(!((P[33]&1u)!=0u&&trailing_zero)){{
    var w0=words[0];var w1=words[1];var w2=words[2];var w3=words[3];var w4=words[4];var w5=words[5];var w6=words[6];var w7=words[7];
    var w8=words[8];var w9=words[9];var w10=words[10];var w11=words[11];var w12=words[12];var w13=words[13];var w14=words[14];var w15=words[15];
    var a=P[0];var b=P[1];var c=P[2];var d=P[3];var e=P[4];var f=P[5];var g=P[6];var h=P[7];

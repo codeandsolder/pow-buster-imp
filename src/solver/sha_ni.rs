@@ -806,7 +806,11 @@ impl GoAwaySolver {
             };
 
             {
-                for low_word in (0..=u32::MAX).step_by(4) {
+                let search_end = self.limit.min(u64::from(u32::MAX) + 1);
+                let mut low_word = self.attempted_nonces.min(search_end);
+                while low_word < search_end {
+                    let valid_lanes = (search_end - low_word).min(4) as usize;
+                    let low_word_u32 = low_word as u32;
                     let mut states0 = prepared_state;
                     let mut states1 = prepared_state;
                     let mut states2 = prepared_state;
@@ -815,7 +819,7 @@ impl GoAwaySolver {
                     let mut msg0 = Align16([0; 16]);
                     msg0[0..8].copy_from_slice(&self.message.challenge);
                     msg0[8] = self.message.high_word;
-                    msg0[9] = low_word;
+                    msg0[9] = low_word_u32;
                     msg0[10] = u32::from_be_bytes([0x80, 0, 0, 0]);
                     msg0[15] = Self::MSG_LEN as _;
 
@@ -823,7 +827,7 @@ impl GoAwaySolver {
                     impl crate::sha256::sha_ni::Plucker for LaneIdPlucker {
                         #[inline(always)]
                         fn pluck_qword2(&mut self, lane: usize, w: &mut __m128i) {
-                            *w = unsafe { _mm_or_si128(*w, _mm_setr_epi32(0, lane as _, 0, 0)) };
+                            *w = unsafe { _mm_add_epi32(*w, _mm_setr_epi32(0, lane as _, 0, 0)) };
                         }
                     }
 
@@ -855,16 +859,18 @@ impl GoAwaySolver {
                         }
                     };
 
-                    let success_lane_idx = result_abs.iter().position(|x| cmp_fn(x, &target));
+                    let success_lane_idx = result_abs[..valid_lanes]
+                        .iter()
+                        .position(|x| cmp_fn(x, &target));
 
-                    self.attempted_nonces += 4;
+                    self.attempted_nonces += valid_lanes as u64;
 
                     if let Some(success_lane_idx) = success_lane_idx {
                         crate::unlikely();
 
                         let mut output_msg: [u32; 16] = [0; 16];
 
-                        let final_low_word = low_word | (success_lane_idx as u32);
+                        let final_low_word = low_word_u32.wrapping_add(success_lane_idx as u32);
                         output_msg[..8].copy_from_slice(&self.message.challenge);
                         output_msg[8] = self.message.high_word;
                         output_msg[9] = final_low_word;
@@ -880,9 +886,7 @@ impl GoAwaySolver {
                         ));
                     }
 
-                    if self.attempted_nonces >= self.limit {
-                        return None;
-                    }
+                    low_word += valid_lanes as u64;
                 }
             }
         }
@@ -897,6 +901,27 @@ impl GoAwaySolver {
 mod tests {
     use super::*;
     use crate::solver::Solver;
+
+    #[test]
+    fn test_goaway_vector_tail_attempt_limits() {
+        let challenge = [b'a'; 32];
+        let mut solver = GoAwaySolver::from(GoAwayMessage::new_bytes(&challenge, 0));
+        solver.set_limit(1);
+        assert!(
+            solver
+                .solve::<{ crate::solver::SOLVE_TYPE_LT }>(0, u64::MAX)
+                .is_none()
+        );
+        assert_eq!(solver.get_attempted_nonces(), 1);
+
+        solver.set_limit(5);
+        assert!(
+            solver
+                .solve::<{ crate::solver::SOLVE_TYPE_LT }>(0, u64::MAX)
+                .is_none()
+        );
+        assert_eq!(solver.get_attempted_nonces(), 5);
+    }
 
     #[test]
     fn test_solve_decimal() {

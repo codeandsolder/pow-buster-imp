@@ -553,7 +553,11 @@ impl crate::solver::Solver for GoAwaySolver {
                 let mut partial_state = prefix_state;
                 crate::sha256::sha2_arx::<8>(&mut partial_state, &[self.message.high_word]);
 
-                for low_word in (0..=u32::MAX).step_by(4) {
+                let search_end = self.limit.min(u64::from(u32::MAX) + 1);
+                let mut low_word = self.attempted_nonces.min(search_end);
+                while low_word < search_end {
+                    let valid_lanes = (search_end - low_word).min(4) as usize;
+                    let low_word_u32 = low_word as u32;
                     let mut state = core::array::from_fn(|i| u32x4_splat(partial_state[i]));
 
                     let mut msg = [
@@ -566,7 +570,7 @@ impl crate::solver::Solver for GoAwaySolver {
                         u32x4_splat(self.message.challenge[6]),
                         u32x4_splat(self.message.challenge[7]),
                         u32x4_splat(self.message.high_word),
-                        v128_or(u32x4_splat(low_word), lane_id_v),
+                        u32x4_add(u32x4_splat(low_word_u32), lane_id_v),
                         u32x4_splat(u32::from_be_bytes([0x80, 0, 0, 0])),
                         u32x4_splat(0),
                         u32x4_splat(0),
@@ -588,25 +592,27 @@ impl crate::solver::Solver for GoAwaySolver {
                     };
 
                     let a_not_met_target = cmp_fn(result_a, u32x4_splat(target));
+                    self.attempted_nonces += valid_lanes as u64;
+                    low_word += valid_lanes as u64;
 
                     if !u32x4_all_true(a_not_met_target) {
                         crate::unlikely();
 
                         let mut extract = [0u32; 4];
                         v128_store(extract.as_mut_ptr().cast(), result_a);
-                        let success_lane_idx = extract
-                            .iter()
-                            .position(|x| {
-                                if TYPE == crate::solver::SOLVE_TYPE_GT {
-                                    *x > target
-                                } else if TYPE == crate::solver::SOLVE_TYPE_LT {
-                                    *x < target
-                                } else {
-                                    *x & mask == target & mask
-                                }
-                            })
-                            .unwrap();
-                        let final_low_word = low_word | (success_lane_idx as u32);
+                        let success_lane_idx = extract[..valid_lanes].iter().position(|x| {
+                            if TYPE == crate::solver::SOLVE_TYPE_GT {
+                                *x > target
+                            } else if TYPE == crate::solver::SOLVE_TYPE_LT {
+                                *x < target
+                            } else {
+                                *x & mask == target & mask
+                            }
+                        });
+                        let Some(success_lane_idx) = success_lane_idx else {
+                            continue;
+                        };
+                        let final_low_word = low_word_u32.wrapping_add(success_lane_idx as u32);
                         let mut output_msg: [u32; 16] = [0; 16];
                         output_msg[..8].copy_from_slice(&self.message.challenge);
                         output_msg[8] = self.message.high_word;
@@ -621,12 +627,6 @@ impl crate::solver::Solver for GoAwaySolver {
                             (self.message.high_word as u64) << 32 | final_low_word as u64,
                             final_sha_state,
                         ));
-                    }
-
-                    self.attempted_nonces += 4;
-
-                    if self.attempted_nonces >= self.limit {
-                        return None;
                     }
                 }
             }
@@ -682,17 +682,17 @@ impl CerberusSolver {
             message.flags,
         );
 
+        let mut word_digits = [b'0'; 4];
         for word in 0u32..10000 {
             if self.attempted_nonces >= self.limit {
                 return None;
             }
-            msg[CENTER_WORD_IDX] = u32::from_be_bytes([
-                (word % 10) as u8 + b'0',
-                ((word / 10) % 10) as u8 + b'0',
-                ((word / 100) % 10) as u8 + b'0',
-                ((word / 1000) % 10) as u8 + b'0',
-            ]);
+            msg[CENTER_WORD_IDX] = u32::from_be_bytes(word_digits);
             for lane_id_idx in 0..(LANE_ID_STR_COMBINED_LE_HI.len() / 4) {
+                if self.attempted_nonces >= self.limit {
+                    return None;
+                }
+                let valid_lanes = (self.limit - self.attempted_nonces).min(4) as usize;
                 unsafe {
                     let mut lane_id_value = v128_load(
                         LANE_ID_STR_COMBINED_LE_HI
@@ -712,18 +712,34 @@ impl CerberusSolver {
 
                     let masked = v128_and(state[0], u32x4_splat(mask));
 
-                    self.attempted_nonces += 4;
+                    self.attempted_nonces += valid_lanes as u64;
 
                     if !u32x4_all_true(masked) {
                         crate::unlikely();
 
                         let mut extract = [0u32; 4];
                         v128_store(extract.as_mut_ptr().cast(), masked);
-                        let success_lane_idx =
-                            extract.iter().position(|x| *x & mask == 0).unwrap() as u64;
-
-                        return Some((word as u64, lane_id_idx as u64 * 4 + success_lane_idx));
+                        if let Some(success_lane_idx) =
+                            extract[..valid_lanes].iter().position(|x| *x & mask == 0)
+                        {
+                            return Some((
+                                word as u64,
+                                lane_id_idx as u64 * 4 + success_lane_idx as u64,
+                            ));
+                        }
                     }
+                    if valid_lanes < 4 {
+                        return None;
+                    }
+                }
+            }
+            if word != 9999 {
+                for digit in &mut word_digits {
+                    if *digit != b'9' {
+                        *digit += 1;
+                        break;
+                    }
+                    *digit = b'0';
                 }
             }
         }
@@ -999,6 +1015,29 @@ mod tests {
                 }
             },
         );
+    }
+
+    #[test]
+    fn test_goaway_vector_tail_attempt_limits() {
+        use crate::solver::Solver as _;
+
+        let challenge = [b'a'; 32];
+        let mut solver = GoAwaySolver::from(GoAwayMessage::new_bytes(&challenge, 0));
+        solver.set_limit(1);
+        assert!(
+            solver
+                .solve::<{ crate::solver::SOLVE_TYPE_LT }>(0, u64::MAX)
+                .is_none()
+        );
+        assert_eq!(solver.get_attempted_nonces(), 1);
+
+        solver.set_limit(5);
+        assert!(
+            solver
+                .solve::<{ crate::solver::SOLVE_TYPE_LT }>(0, u64::MAX)
+                .is_none()
+        );
+        assert_eq!(solver.get_attempted_nonces(), 5);
     }
 
     #[test]

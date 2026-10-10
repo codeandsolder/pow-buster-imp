@@ -43,24 +43,20 @@ impl SingleBlockSolver {
         let target = target & mask;
 
         for nonzero_digit in 1..=9 {
+            let start = self.message.digit_index;
+            let varying_range = if NO_TRAILING_ZEROS {
+                message_be.0[start..start + 8].fill(b'0');
+                message_be.0[start + 8] = b'0' + nonzero_digit as u8;
+                start..start + 8
+            } else {
+                message_be.0[start] = b'0' + nonzero_digit as u8;
+                message_be.0[start + 1..start + 9].fill(b'0');
+                start + 1..start + 9
+            };
+
             for key in 0..100_000_000 {
                 if self.attempted_nonces >= self.limit {
                     return None;
-                }
-                let mut key_copy = key;
-
-                if NO_TRAILING_ZEROS {
-                    for i in (0..8).rev() {
-                        message_be.0[self.message.digit_index + i] = (key_copy % 10) as u8 + b'0';
-                        key_copy /= 10;
-                    }
-                    message_be.0[self.message.digit_index + 8] = b'0' + nonzero_digit as u8;
-                } else {
-                    for i in (1..9).rev() {
-                        message_be.0[self.message.digit_index + i] = (key_copy % 10) as u8 + b'0';
-                        key_copy /= 10;
-                    }
-                    message_be.0[self.message.digit_index] = b'0' + nonzero_digit as u8;
                 }
 
                 let mut state = self.message.prefix_state;
@@ -84,6 +80,13 @@ impl SingleBlockSolver {
                         transformed_key += 100_000_000 * nonzero_digit;
                     }
                     return Some((transformed_key + self.message.nonce_addend, state));
+                }
+
+                if key + 1 < 100_000_000 {
+                    let wrapped = crate::solver::increment_ascii_decimal(
+                        &mut message_be.0[varying_range.clone()],
+                    );
+                    debug_assert!(!wrapped);
                 }
             }
         }
@@ -161,20 +164,18 @@ impl crate::solver::Solver for DoubleBlockSolver {
         terminal_message_schedule[15] = (self.message.message_length * 8) as u32;
         crate::sha256::do_message_schedule_k_w(&mut terminal_message_schedule);
 
-        for key in (if self.message.nonce_addend == 0 {
+        let first_key = if self.message.nonce_addend == 0 {
             100_000_000
         } else {
             0
-        })..1_000_000_000
-        {
-            let mut key_copy = key;
+        };
+        let digit_start = DoubleBlockMessage::DIGIT_IDX as usize;
+        buffer[digit_start..digit_start + 9].fill(b'0');
+        if first_key != 0 {
+            buffer[digit_start] = b'1';
+        }
 
-            for j in (0..9).rev() {
-                let digit = key_copy % 10;
-                key_copy /= 10;
-                buffer[DoubleBlockMessage::DIGIT_IDX as usize + j] = digit as u8 + b'0';
-            }
-
+        for key in first_key..1_000_000_000 {
             let mut state = self.message.prefix_state;
             sha2::compress256(&mut state, &[buffer]);
 
@@ -212,6 +213,13 @@ impl crate::solver::Solver for DoubleBlockSolver {
 
             if self.attempted_nonces >= self.limit {
                 return None;
+            }
+
+            if key + 1 < 1_000_000_000 {
+                let wrapped = crate::solver::increment_ascii_decimal(
+                    &mut buffer[digit_start..digit_start + 9],
+                );
+                debug_assert!(!wrapped);
             }
         }
 
@@ -459,24 +467,12 @@ impl crate::solver::Solver for CerberusSolver {
                     message.salt_residual_len + 8 < message.salt_residual.len(),
                     "there must be at least 9 bytes of headroom for the nonce"
                 );
-                for nonce in 0u64..remaining_limit {
-                    let mut nonce_copy = nonce;
-                    for i in (0..9).rev() {
-                        let msg = decompose_blocks_mut(&mut msg);
-                        #[cfg(target_endian = "little")]
-                        unsafe {
-                            *msg.get_unchecked_mut(message.salt_residual_len + i) =
-                                (nonce_copy % 10) as u8 + b'0';
-                        }
-                        #[cfg(target_endian = "big")]
-                        {
-                            *msg.get_unchecked_mut(message.salt_residual_len + i) =
-                                (nonce_copy % 10) as u8 + b'0';
-                        }
-                        nonce_copy /= 10;
-                    }
-                    debug_assert_eq!(nonce_copy, 0);
-
+                {
+                    let bytes = decompose_blocks_mut(&mut msg);
+                    bytes[message.salt_residual_len..message.salt_residual_len + 9].fill(b'0');
+                }
+                let search_limit = remaining_limit.min(1_000_000_000);
+                for nonce in 0u64..search_limit {
                     let hash = crate::blake3::compress8(
                         &message.prefix_state,
                         &msg,
@@ -488,15 +484,24 @@ impl crate::solver::Solver for CerberusSolver {
                     if ((hash[0] as u64) << 32 | (hash[1] as u64)) & mask == 0 {
                         crate::unlikely();
 
-                        return Some(((nonce + message.nonce_addend) as u64, hash));
+                        return Some((nonce + message.nonce_addend, hash));
+                    }
+
+                    if nonce + 1 < search_limit {
+                        let bytes = decompose_blocks_mut(&mut msg);
+                        let wrapped = crate::solver::increment_ascii_decimal(
+                            &mut bytes[message.salt_residual_len..message.salt_residual_len + 9],
+                        );
+                        debug_assert!(!wrapped);
                     }
                 }
             }
             CerberusMessage::Binary(message) => {
                 let mut msg = [0; 16];
                 msg[0] = message.first_word;
-                for nonce in 0..(remaining_limit.min(u32::MAX as u64) as u32) {
-                    msg[1] = nonce;
+                let search_limit = remaining_limit.min(u64::from(u32::MAX) + 1);
+                for nonce in 0..search_limit {
+                    msg[1] = nonce as u32;
 
                     let hash = crate::blake3::compress8(
                         &message.midstate,
