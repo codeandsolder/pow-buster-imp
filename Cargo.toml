@@ -56,7 +56,7 @@ wasm-bindgen = { version = "0.2" }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 
 [package.metadata.wasm-pack.profile.release]
-wasm-opt = ["-O4", "--enable-bulk-memory", "--enable-simd"]
+wasm-opt = false
 
 [dev-dependencies]
 bincode = "1.3"
