@@ -37,7 +37,7 @@ axum-extra = { version = "0.12.5", features = ["typed-header"], optional = true 
 headers = { version = "0.4", optional = true }
 rust-embed = { version = "8.7", optional = true, features = ["mime-guess"] }
 semver = { version = "1.0", default-features = false, optional = true }
-generic-array = { version = "=0.14.7" } # TODO: remove this pin once RustCrypt migrate off of it
+generic-array = { version = "=0.14.9" } # TODO: remove this pin once RustCrypt migrate off of it
 wgpu = { version = "30.0.1", optional = true }
 bytemuck = { version = "1.24", features = ["derive"], optional = true }
 futures-channel = { version = "0.3", optional = true }
